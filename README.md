@@ -126,8 +126,8 @@ Per GitHub il file reale `telegram_secrets.h` va ignorato; il template versionat
 - `esp32_layout_common.ps1`
   Helper condiviso dagli script PowerShell. Contiene offset, validazioni e logica comune del layout ESP32.
 
-- `boot_app0.bin`
-  Binario di supporto ESP32 richiesto dal layout flash completo.
+- `telegram_secrets.example.h`
+  Template locale per configurare le credenziali Telegram senza versionare i segreti reali.
 
 ### Recovery
 
@@ -140,48 +140,28 @@ Per GitHub il file reale `telegram_secrets.h` va ignorato; il template versionat
 - `ESP32S2_Recovery_OTA/partitions.csv`
   Copia compatibile della tabella partizioni per la build recovery su ambienti che richiedono il nome standard `partitions.csv`.
 
-- `ESP32S2_Recovery_OTA/boot_app0.bin`
-  Copia locale del binario `boot_app0` usata nella build recovery.
+- `ESP32S2_Recovery_OTA/`
+  Sottoprogetto recovery/factory completo, versionato insieme al firmware principale.
 
-### Binari e artefatti utili
+### File generati localmente ma non versionati
+
+Questi file possono comparire nella cartella di lavoro dopo la build o il flash, ma non fanno parte del repository GitHub:
 
 - `ESP32S2_WiFiManager_WebServer.ino.bin`
-  Binario principale da caricare via Web OTA.
-
 - `ESP32S2_WiFiManager_WebServer.ino.bootloader.bin`
-  Bootloader della build corrente del firmware principale.
-
 - `ESP32S2_WiFiManager_WebServer.ino.partitions.bin`
-  Tabella partizioni compilata del firmware principale.
-
 - `ESP32S2_WiFiManager_WebServer.ino.merged.bin`
-  Immagine completa unificata del firmware principale.
-
 - `ESP32S2_Recovery_OTA/ESP32S2_Recovery_OTA.ino.bin`
-  Binario recovery pronto all'uso.
-
 - `ESP32S2_Recovery_OTA/ESP32S2_Recovery_OTA.ino.bootloader.bin`
-  Bootloader della build recovery.
-
 - `ESP32S2_Recovery_OTA/ESP32S2_Recovery_OTA.ino.partitions.bin`
-  Tabella partizioni compilata del recovery.
-
 - `ESP32S2_Recovery_OTA/ESP32S2_Recovery_OTA.ino.merged.bin`
-  Immagine completa unificata del recovery.
-
-### Cartelle di supporto
-
+- `boot_app0.bin`
 - `build/`
-  Artefatti intermedi della compilazione del firmware principale. Utile per debug, map file e output completi, ma non e un punto da modificare a mano.
-
 - `ESP32S2_Recovery_OTA/build/`
-  Artefatti intermedi della compilazione recovery.
+- `build_last_compile*.log`
+- `telegram_secrets.h`
 
-- `.claude/`
-  Metadati locali dell'ambiente di lavoro. Non servono al firmware.
-
-- `ESP32S2_Recovery_OTA/.claude/`
-  Metadati locali del sottoprogetto recovery. Non servono al firmware.
+Sono output locali o file sensibili esclusi tramite `.gitignore`.
 
 ### Cosa usare davvero nella pratica
 
