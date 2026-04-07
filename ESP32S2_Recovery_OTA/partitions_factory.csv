@@ -1,0 +1,38 @@
+# Custom 4MB layout with factory recovery partition
+# factory:  1024 KB @ 0x10000  (recovery firmware, currently ~870 KB)
+# ota_0:    1472 KB @ 0x110000 (main firmware slot A, currently ~1197 KB)
+# ota_1:    1472 KB @ 0x280000 (main firmware slot B)
+# coredump:   64 KB @ 0x3F0000
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+factory,    app,  factory,  0x10000,  0x100000,
+ota_0,      app,  ota_0,    0x110000, 0x170000,
+ota_1,      app,  ota_1,    0x280000, 0x170000,
+coredump,   data, coredump, 0x3F0000, 0x10000,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

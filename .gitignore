@@ -1,0 +1,28 @@
+# Local secrets
+telegram_secrets.h
+
+# Codex / local tooling
+.claude/
+
+# Arduino / build outputs
+build/
+ESP32S2_Recovery_OTA/build/
+*.bin
+*.elf
+*.map
+*.partitions.bin
+boot_app0.bin
+
+# Build logs
+build_last_compile.log
+build_last_compile_stdout.log
+build_last_compile_stderr.log
+build_last_compile_stdout-*.log
+
+# OS / editor noise
+Thumbs.db
+Desktop.ini
+*.tmp
+
+# Stray local marker files
+1.5.6
