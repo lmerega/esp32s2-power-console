@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Project README
+    url: https://github.com/lmerega/esp32s2-power-console/blob/main/README.md
+    about: Verifica prima la documentazione operativa e gli endpoint gia disponibili.

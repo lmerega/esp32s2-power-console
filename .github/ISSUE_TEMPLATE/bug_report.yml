@@ -1,0 +1,61 @@
+name: Bug report
+description: Segnala un problema reale del firmware o del tooling.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Grazie. Compila i campi minimi per rendere il problema riproducibile.
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      placeholder: "es. 1.5.12"
+    validations:
+      required: true
+  - type: input
+    id: board
+    attributes:
+      label: Board
+      placeholder: "es. LOLIN S2 Mini"
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problema osservato
+      placeholder: Descrivi il sintomo in modo chiaro.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Passi per riprodurlo
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Comportamento atteso
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log utili
+      description: Incolla output di /api/status, /api/telegram/health, /api/buglog o /api/logs se rilevanti.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: Ho rimosso token, password WiFi e dati sensibili
+          required: true
+        - label: Ho controllato README e changelog prima di aprire la issue
+          required: false

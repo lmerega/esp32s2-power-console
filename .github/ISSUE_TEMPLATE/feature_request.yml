@@ -1,0 +1,32 @@
+name: Feature request
+description: Proponi un miglioramento del firmware o del workflow.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Problema o esigenza
+      placeholder: Che cosa manca oggi?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposta
+      placeholder: Come immagini la soluzione?
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impatto previsto
+      placeholder: Impatto su UI, OTA, recovery, WiFi, Telegram o diagnostica.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: Ho valutato il trade-off tra complessita e robustezza
+          required: true

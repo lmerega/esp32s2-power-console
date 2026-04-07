@@ -1,5 +1,7 @@
 # ESP32 Power Console
 
+[![Arduino Build](https://github.com/lmerega/esp32s2-power-console/actions/workflows/arduino-build.yml/badge.svg)](https://github.com/lmerega/esp32s2-power-console/actions/workflows/arduino-build.yml)
+
 Firmware per `LOLIN S2 Mini` usato come controllo remoto del tasto power del PC tramite optoisolatore.
 
 Versione firmware principale corrente:
@@ -49,6 +51,11 @@ Tooling essenziale mantenuto nel progetto:
 - `flash_full_serial.ps1` / `flash_full_serial.bat`
 - `esp32_layout_common.ps1`
 
+Documenti di progetto:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [SECURITY.md](SECURITY.md)
+
 Uso rapido:
 
 1. Esegui `build_bin.bat`
@@ -79,6 +86,13 @@ Setup locale segreti Telegram:
 3. compila normalmente con `build_bin.bat`
 
 Per GitHub il file reale `telegram_secrets.h` va ignorato; il template versionato resta `telegram_secrets.example.h`.
+
+Automazione repository inclusa:
+
+- workflow GitHub Actions per compilare firmware principale e recovery
+- template per issue e pull request
+- `CODEOWNERS` per review piu chiare
+- `Dependabot` per aggiornare le GitHub Actions
 
 ## Mappa del progetto
 
@@ -170,6 +184,16 @@ Sono output locali o file sensibili esclusi tramite `.gitignore`.
 - Per aggiornare via rete: `flash.ps1` oppure `flash.bat`
 - Per riflashare via seriale: `flash_full_serial.ps1` oppure `flash_full_serial.bat`
 - Per OTA dalla web UI: usare solo `ESP32S2_WiFiManager_WebServer.ino.bin`
+
+### Continuous Integration
+
+Il repository include una workflow GitHub Actions che:
+
+- compila il firmware principale per `lolin_s2_mini`
+- compila il firmware recovery/factory
+- usa core ESP32 `3.3.7`
+- installa automaticamente le librerie esterne minime
+- pubblica gli artefatti di build della run
 
 ## Configurazione persistente
 
