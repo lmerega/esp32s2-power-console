@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-04-08
+
+- Bump firmware principale a `1.5.18`
+- Confermata stabilita' overnight della variante senza Telegram on-board
+- Telegram rimosso dal runtime dell'ESP32-S2 come canale operativo principale
+- Aggiunto report HTTP leggero verso Node-RED al `boot` e alla riconnessione WiFi
+- Nuovo template locale `local_services.example.h` per configurare `NODERED_REPORT_URL_VALUE`
+- Aggiunta cartella `node-red/` con flow importabile e documentazione dedicata
+- Il bridge Node-RED ora gestisce:
+  - cache dell'ultimo IP noto
+  - keepalive leggero con `GET /api/status`
+  - comandi Telegram `/ip`, `/status`, `/pulse`, `/force`
+  - notifica Telegram automatica su `boot` e `wifi_reconnected`
+- Corretto il parsing del `POST /esp32/presence` nel flow Node-RED
+- `/ip` ora usa anche lo status cache come fallback se il report presence non e' ancora disponibile
+- README aggiornato per riflettere la nuova architettura `ESP32 + Node-RED bridge`
+
 ## 2026-04-07
 
 - Bump firmware principale fino a `1.5.12`

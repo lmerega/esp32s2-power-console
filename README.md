@@ -4,14 +4,14 @@ Firmware per `LOLIN S2 Mini` usato come controllo remoto del tasto power del PC 
 
 Versione firmware principale corrente:
 
-- `1.5.12`
+- `1.5.18`
 
 Ultima build verificata localmente:
 
-- data: `2026-04-07`
-- main bin: `1,262,176 B`
-- sketch usage: `1,262,019 B / 1,507,328 B` (`83%`)
-- RAM globale: `69,260 B / 327,680 B` (`21%`)
+- data: `2026-04-08`
+- main bin: `1,146,000 B`
+- sketch usage: `1,145,851 B / 1,507,328 B` (`76%`)
+- RAM globale: `68,868 B / 327,680 B` (`21%`)
 - build locale completata con successo: `si`
 
 ## Funzioni principali
@@ -22,9 +22,10 @@ Ultima build verificata localmente:
 - Comando `force shutdown` a pressione lunga
 - Modalita `TEST ON/OFF` per diagnostica pin
 - Timeout automatico per `TEST ON`
-- Telegram minimale read-only per discovery IP e stato
-- Notifica Telegram al boot e alla riconnessione WiFi
-- Auto-recovery del task Telegram se resta bloccato o sparisce
+- Report HTTP leggero verso Node-RED al boot e alla riconnessione WiFi
+- Bridge Telegram esterno via Node-RED per `/ip`, `/status`, `/pulse` e `/force`
+- Keepalive Node-RED via `GET /api/status` ogni `10` minuti
+- Notifica Telegram automatica da Node-RED su `boot` e `wifi_reconnected`
 - Web OTA
 - Timing persistenti in `Preferences`
 - Buglog persistente in `NVS` con `magic`, `CRC8` e ring buffer
@@ -62,7 +63,7 @@ Note build:
 - Il wrapper `.bat` accetta anche l'alias rapido `bump`
 - Lo script continua a pulire i `.bin` precedenti e a copiare gli output nella cartella dello sketch
 - Gli script di test PowerShell non fanno piu parte del workspace operativo
-- La build validata piu recente del main firmware pesa `1,262,176 B`
+- La build validata piu recente del main firmware pesa `1,146,000 B`
 
 ## Repository e GitHub
 
@@ -71,21 +72,27 @@ Regole consigliate per il repository:
 - versionare sorgenti, script, partizioni, documentazione e firmware recovery
 - non versionare artefatti di build, log temporanei, cartelle `build/` e segreti locali
 - non pubblicare `telegram_secrets.h`
+- non pubblicare `local_services.h`
 
-Setup locale segreti Telegram:
+Setup locale servizi:
 
-1. copia `telegram_secrets.example.h` in `telegram_secrets.h`
-2. inserisci `TELEGRAM_BOT_TOKEN_VALUE` e `TELEGRAM_CHAT_ID_VALUE`
+1. copia `local_services.example.h` in `local_services.h`
+2. inserisci `NODERED_REPORT_URL_VALUE`, ad esempio `http://192.168.90.60:1880/esp32/presence`
 3. compila normalmente con `build_bin.bat`
 
-Per GitHub il file reale `telegram_secrets.h` va ignorato; il template versionato resta `telegram_secrets.example.h`.
+Setup locale opzionale bot Telegram:
+
+1. se vuoi riusare il token del bot anche fuori da Node-RED, copia `telegram_secrets.example.h` in `telegram_secrets.h`
+2. inserisci `TELEGRAM_BOT_TOKEN_VALUE` e `TELEGRAM_CHAT_ID_VALUE`
+
+Per GitHub i file reali `telegram_secrets.h` e `local_services.h` vanno ignorati; i template versionati restano `telegram_secrets.example.h` e `local_services.example.h`.
 
 ## Mappa del progetto
 
 ### Root del progetto
 
 - `ESP32S2_WiFiManager_WebServer.ino`
-  Firmware principale. Gestisce GPIO power, dashboard web, WiFi, fallback AP, OTA e Telegram read-only.
+  Firmware principale. Gestisce GPIO power, dashboard web, WiFi, fallback AP, OTA e il report presence verso Node-RED.
 
 - `README.md`
   Documento operativo principale. Spiega uso, build, flash, API e struttura del progetto.
@@ -129,6 +136,15 @@ Per GitHub il file reale `telegram_secrets.h` va ignorato; il template versionat
 - `telegram_secrets.example.h`
   Template locale per configurare le credenziali Telegram senza versionare i segreti reali.
 
+- `local_services.example.h`
+  Template locale per configurare l'endpoint Node-RED che riceve il report IP/presenza della board.
+
+- `node-red/esp32-power-console-flow.json`
+  Flow Node-RED importabile per il bridge Telegram, la cache IP e il keepalive HTTP verso la board.
+
+- `node-red/README.md`
+  Guida rapida all'import del flow Node-RED e alla configurazione del bridge esterno.
+
 ### Recovery
 
 - `ESP32S2_Recovery_OTA/ESP32S2_Recovery_OTA.ino`
@@ -160,6 +176,8 @@ Questi file possono comparire nella cartella di lavoro dopo la build o il flash,
 - `ESP32S2_Recovery_OTA/build/`
 - `build_last_compile*.log`
 - `telegram_secrets.h`
+- `local_services.h`
+- `hourly_observation_*.txt`
 
 Sono output locali o file sensibili esclusi tramite `.gitignore`.
 
@@ -180,7 +198,6 @@ Salvata nel namespace `Preferences`:
 - `force_ms`
 - `wifi_ssid`
 - `wifi_pass`
-- `tg_upd_id`
 
 Salvata nel namespace `buglog`:
 
@@ -200,7 +217,7 @@ Sezioni diagnostiche:
 - `Log RAM` per tracing volatile di sessione
 - `Buglog Persistente` per eventi che devono sopravvivere a reboot e power cycle
 - legenda inline per `severity`, codici e campi heartbeat (`fh`, `mb`, `wf`, `la`, `ta`)
-- diagnostica Telegram con stato task, heartbeat e recovery
+- diagnostica runtime della board senza dipendere dal bridge Telegram esterno
 
 La dashboard ora mostra:
 
@@ -310,60 +327,30 @@ Esempio body per la configurazione WiFi:
 
 - `ssid=NomeRete&password=PasswordRete`
 
-## Telegram
+## Bridge Telegram
 
-Telegram e stato ridotto a canale secondario read-only:
+Nella versione attuale Telegram non gira piu sull'ESP32-S2. Il canale Telegram e' esterno e viene gestito da Node-RED nella stessa LAN.
 
-- notifica IP al boot
-- notifica IP alla riconnessione WiFi
-- polling lento e minimale per richieste testuali
-- recovery automatica locale se il task Telegram smette di fare polling
-- nessun comando remoto che agisce su GPIO, reboot, OTA o recovery
+Il bridge fa questo:
 
-Comandi gestiti:
+- riceve dal firmware il report presence via `POST /esp32/presence`
+- salva l'ultimo IP noto della board
+- interroga la board con `GET /api/status` ogni `10` minuti
+- risponde ai comandi Telegram `/ip`, `/status`, `/pulse`, `/force`
+- invia una notifica Telegram automatica su `boot` e `wifi_reconnected`
 
-- `/start`
-- `/ip`
-- `/status`
-- `/help`
+Vantaggi pratici:
 
-Testo consigliato per `/start`:
+- niente polling Telegram o TLS pesante sulla board
+- memoria dell'ESP32-S2 stabile anche su run lunghi
+- bridge e bot gestiti su un host piu robusto
+- fallback locale sempre disponibile via Web UI, AP fallback e OTA
 
-```text
-Power Console pronto.
+File utili:
 
-Comandi disponibili:
-/ip - mostra IP, hostname e rete WiFi
-/status - mostra stato sintetico del device
-/help - mostra questo aiuto
-
-Nota:
-Telegram e un canale secondario read-only.
-Il recupero locale resta via Web UI, AP fallback e OTA.
-```
-
-Testo consigliato per `/help`:
-
-```text
-Comandi disponibili:
-/start - bootstrap iniziale
-/ip - IP corrente, hostname e WiFi
-/status - stato sintetico del device
-/help - elenco comandi
-
-Telegram e solo read-only:
-nessun comando remoto per GPIO, reboot, OTA o recovery.
-```
-
-Nota operativa:
-
-- Telegram non deve essere considerato un canale vitale
-- se Telegram e offline, il firmware principale continua a funzionare
-- il recupero locale resta affidato a web UI, AP fallback e OTA/recovery
-- `/start` e il comando di bootstrap predefinito da usare per recuperare IP e stato
-- se Telegram smette di reagire, controlla prima `/api/telegram/health`
-- se il task risulta fermo o gli update restano in coda, usa `/api/telegram/recover`
-- usa `/api/telegram/recover?reset_offset=1` solo se vuoi riallineare da zero il polling
+- `node-red/esp32-power-console-flow.json`
+- `node-red/README.md`
+- `local_services.example.h`
 
 ## Note hardware
 

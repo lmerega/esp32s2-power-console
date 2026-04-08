@@ -1,5 +1,6 @@
 # Local secrets
 telegram_secrets.h
+local_services.h
 
 # Codex / local tooling
 .claude/
@@ -18,6 +19,11 @@ build_last_compile.log
 build_last_compile_stdout.log
 build_last_compile_stderr.log
 build_last_compile_stdout-*.log
+hourly_observation_*.txt
+
+# Local Node-RED backups
+node-red/flows-backup-*.json
+node-red/flows-live-before-*.json
 
 # OS / editor noise
 Thumbs.db

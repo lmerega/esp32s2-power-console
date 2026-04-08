@@ -2,6 +2,7 @@
 #include <WebServer.h>
 #include <WiFiManager.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
 #include <esp_app_desc.h>
 #include <esp_image_format.h>
@@ -19,7 +20,7 @@ WebServer server(80);
 WiFiManager wm;
 Preferences prefs;
 
-#define FW_VERSION "1.5.12"
+#define FW_VERSION "1.5.18"
 
 // =====================
 // PIN (S2 mini)
@@ -57,6 +58,10 @@ String wifiPassConfig = "";
 #include "telegram_secrets.h"
 #endif
 
+#if __has_include("local_services.h")
+#include "local_services.h"
+#endif
+
 #ifndef TELEGRAM_BOT_TOKEN_VALUE
 #define TELEGRAM_BOT_TOKEN_VALUE ""
 #endif
@@ -65,11 +70,20 @@ String wifiPassConfig = "";
 #define TELEGRAM_CHAT_ID_VALUE ""
 #endif
 
+#ifndef TELEGRAM_RUNTIME_ENABLED
+#define TELEGRAM_RUNTIME_ENABLED 0
+#endif
+
+#ifndef NODERED_REPORT_URL_VALUE
+#define NODERED_REPORT_URL_VALUE ""
+#endif
+
 // Telegram bot dedicated to this device.
 // The device both sends notifications and polls getUpdates for commands.
 const char *TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN_VALUE;  // Set via build flags / build_opt.h.
 const char *TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID_VALUE;      // Set via build flags / build_opt.h.
-const bool TELEGRAM_TASK_AUTOSTART = true;
+const char *NODERED_REPORT_URL = NODERED_REPORT_URL_VALUE;  // Local HTTP endpoint on Node-RED / LAN service.
+const bool TELEGRAM_TASK_AUTOSTART = TELEGRAM_RUNTIME_ENABLED;
 static volatile int tgLastHttpCode = 0;  // volatile: scritto da telegramTask, letto da loop
 bool telegramNotifyPending = false;
 unsigned long telegramNextTryMs = 0;
@@ -81,9 +95,21 @@ const uint32_t TELEGRAM_HTTP_CONNECT_TIMEOUT_MS = 5000;
 const uint32_t TELEGRAM_SEND_TIMEOUT_MS = 4500;
 const uint32_t TELEGRAM_SHORT_HTTP_TIMEOUT_MS = 5000;
 const uint32_t TELEGRAM_WEBHOOK_HTTP_TIMEOUT_MS = 6500;
+const uint8_t TELEGRAM_POLL_RESULT_LIMIT = 1;
 const unsigned long TELEGRAM_TASK_RETRY_MS = 1500;
 const unsigned long TELEGRAM_LOW_HEAP_PAUSE_MS = 300000;
 const uint32_t TELEGRAM_MIN_MAX_BLOCK_BYTES = 24000;
+const uint32_t TELEGRAM_HEAP_RECOVERY_MAX_BLOCK_BYTES = 16000;
+const uint32_t TELEGRAM_HEAP_RECOVERY_FREE_HEAP_BYTES = 22000;
+const unsigned long TELEGRAM_HEAP_RECOVERY_RESTART_COOLDOWN_MS = 15000;
+const unsigned long TELEGRAM_HEAP_RECOVERY_PAUSE_MS = 5000;
+const uint32_t TELEGRAM_SOFT_RECYCLE_MAX_BLOCK_BYTES = 42000;
+const uint8_t TELEGRAM_SOFT_RECYCLE_POLL_OK_LIMIT = 3;
+const unsigned long TELEGRAM_SOFT_RECYCLE_TASK_AGE_MS = 4UL * 60UL * 1000UL;
+const unsigned long TELEGRAM_SOFT_RECYCLE_PAUSE_MS = 4000;
+const bool TELEGRAM_BOOT_NOTIFY_ENABLED = false;
+const bool TELEGRAM_AUTO_WEBHOOK_PRIME_ENABLED = false;
+const bool TELEGRAM_AUTO_RECOVERY_FOLLOWUP_ENABLED = false;
 const unsigned long TELEGRAM_ERROR_BACKOFF_BASE_MS = 1200;
 const unsigned long TELEGRAM_ERROR_BACKOFF_MAX_MS = 20000;
 const uint8_t TELEGRAM_MAX_CONSECUTIVE_ERRORS = 8;
@@ -101,6 +127,14 @@ const uint16_t TELEGRAM_CMD_MAX_HITS = 4;
 const unsigned long TELEGRAM_CMD_THROTTLE_MS = 30000;
 const unsigned long TELEGRAM_TASK_STALE_RESTART_MS = 125000;
 const unsigned long TELEGRAM_TASK_RESTART_COOLDOWN_MS = 180000;
+const size_t TELEGRAM_API_PATH_CAPACITY = 192;
+const size_t TELEGRAM_API_DESC_CAPACITY = 96;
+const size_t TELEGRAM_SMALL_JSON_CAPACITY = 256;
+const size_t TELEGRAM_SEND_JSON_CAPACITY = 1024;
+const size_t TELEGRAM_SEND_BODY_CAPACITY = 1280;
+const size_t TELEGRAM_SMALL_BODY_CAPACITY = 128;
+const size_t TELEGRAM_POLL_FILTER_JSON_CAPACITY = 256;
+const size_t TELEGRAM_POLL_JSON_CAPACITY = 3072;
 const unsigned long WATCHDOG_CHECK_EVERY_MS = 1000;
 const unsigned long WATCHDOG_LOOP_STALL_MS = 45000;
 const unsigned long OTA_STALL_REBOOT_MS = 120000;
@@ -109,6 +143,9 @@ const unsigned long BUGLOG_HEARTBEAT_ALERT_MS = 2UL * 60UL * 1000UL;
 const unsigned long BUGLOG_HEARTBEAT_STALE_TASK_MS = 10000UL;
 const uint32_t BUGLOG_HEARTBEAT_LOW_FREE_HEAP_BYTES = 50000UL;
 const unsigned long WIFI_OFFLINE_TO_AP_MS = 5000;
+const unsigned long NODERED_REPORT_RETRY_MS = 15000UL;
+const unsigned long NODERED_REPORT_BOOT_DELAY_MS = 1500UL;
+const uint32_t NODERED_REPORT_TIMEOUT_MS = 2500UL;
 const char *FALLBACK_AP_SSID = "ESP32S2-Setup";
 const char *OTA_UPLOAD_HEADERS[] = {"X-File-Size"};
 const size_t OTA_UPLOAD_HEADERS_COUNT = 1;
@@ -132,6 +169,7 @@ TaskHandle_t safetyTaskHandle = nullptr;
 SemaphoreHandle_t telegramHttpMutex = nullptr;
 SemaphoreHandle_t logMutex = nullptr;
 SemaphoreHandle_t prefsMutex = nullptr;
+volatile bool telegramHttpInFlight = false;
 // BUG-1 FIX: char array + portENTER_CRITICAL invece di String
 // (String usa heap con new/delete internamente; su S2 una preemption durante operator=
 //  pu?? corrompere il puntatore se letto contemporaneamente dal loop task via statusJson)
@@ -249,10 +287,20 @@ volatile unsigned long loopHeartbeatMs = 0;
 volatile unsigned long telegramHeartbeatMs = 0;
 unsigned long telegramTaskLastRestartMs = 0;
 volatile uint32_t telegramTaskRestartCount = 0;
+volatile bool telegramHeapRecoveryRequested = false;
+volatile uint32_t telegramHeapRecoveryFreeHeap = 0;
+volatile uint32_t telegramHeapRecoveryMaxBlock = 0;
+unsigned long telegramHeapRecoveryLastLogMs = 0;
+uint8_t telegramPollOkSinceRestart = 0;
+char telegramHeapRecoveryReasonBuf[24] = "heap_guard";
+uint16_t telegramHeapRecoveryReasonCode = 1313;
 WebRateLimitBucket webSensitiveBucket;
 WebRateLimitBucket webWifiScanBucket;
 WebRateLimitBucket webOtaBucket;
 char telegramNotifyReasonBuf[24] = "boot";
+bool nodeRedReportPending = false;
+unsigned long nodeRedReportDueMs = 0;
+char nodeRedReportReasonBuf[24] = "";
 portMUX_TYPE telegramStateMux = portMUX_INITIALIZER_UNLOCKED;
 
 // =====================
@@ -269,6 +317,36 @@ bool ledBlinkState = false;
 bool wifiScanPending = false;
 unsigned long wifiScanStartedMs = 0;
 unsigned long buglogHeartbeatNextMs = 0;
+const unsigned long HEAP_PROBE_LOG_COOLDOWN_MS = 10UL * 60UL * 1000UL;
+const uint32_t HEAP_PROBE_DROP_FREE_BYTES = 8192UL;
+const uint32_t HEAP_PROBE_DROP_MAX_BLOCK_BYTES = 4096UL;
+const uint32_t HEAP_PROBE_NEW_LOW_STEP_BYTES = 2048UL;
+const uint32_t HEAP_PROBE_CRITICAL_FREE_BYTES = 24576UL;
+const uint32_t HEAP_PROBE_CRITICAL_MAX_BLOCK_BYTES = 12288UL;
+
+struct HeapSnapshot {
+  uint32_t freeHeap = 0;
+  uint32_t maxBlock = 0;
+};
+
+struct HeapProbeState {
+  uint32_t minFreeHeap = 0;
+  uint32_t minMaxBlock = 0;
+  unsigned long lastLogMs = 0;
+};
+
+HeapProbeState heapProbeTelegramPoll;
+HeapProbeState heapProbeTelegramSend;
+HeapProbeState heapProbeTelegramRecovery;
+HeapProbeState heapProbeStatusJson;
+HeapProbeState heapProbeWebLogs;
+HeapProbeState heapProbeWifiScan;
+HeapProbeState heapProbeTelegramStatusMsg;
+HeapProbeState heapProbeBootConfig;
+HeapProbeState heapProbeBootWifi;
+HeapProbeState heapProbeBootNtp;
+HeapProbeState heapProbeBootHttp;
+HeapProbeState heapProbeBootTasks;
 
 // =====================
 // Helpers
@@ -342,7 +420,13 @@ bool outputIsHigh() {
 }
 
 bool telegramConfigured() {
-  return strlen(TELEGRAM_BOT_TOKEN) > 0 && strlen(TELEGRAM_CHAT_ID) > 0;
+  return TELEGRAM_RUNTIME_ENABLED &&
+         strlen(TELEGRAM_BOT_TOKEN) > 0 &&
+         strlen(TELEGRAM_CHAT_ID) > 0;
+}
+
+bool nodeRedReportConfigured() {
+  return strlen(NODERED_REPORT_URL) > 0;
 }
 
 String bootSessionIdHex() {
@@ -359,6 +443,115 @@ bool lockLogs(TickType_t timeoutTicks = pdMS_TO_TICKS(120)) {
 void unlockLogs() {
   if (logMutex != nullptr) xSemaphoreGive(logMutex);
 }
+
+HeapSnapshot captureHeapSnapshot() {
+  HeapSnapshot snap;
+  snap.freeHeap = ESP.getFreeHeap();
+  snap.maxBlock = ESP.getMaxAllocHeap();
+  return snap;
+}
+
+void maybeLogHeapProbe(const char *tag, uint16_t code, HeapProbeState &state, const HeapSnapshot &before) {
+  HeapSnapshot after = captureHeapSnapshot();
+  bool firstSample = (state.minFreeHeap == 0 || state.minMaxBlock == 0);
+  if (firstSample) {
+    state.minFreeHeap = before.freeHeap;
+    state.minMaxBlock = before.maxBlock;
+  }
+
+  bool freeDrop = before.freeHeap > after.freeHeap &&
+                  (before.freeHeap - after.freeHeap) >= HEAP_PROBE_DROP_FREE_BYTES;
+  bool maxDrop = before.maxBlock > after.maxBlock &&
+                 (before.maxBlock - after.maxBlock) >= HEAP_PROBE_DROP_MAX_BLOCK_BYTES;
+  bool newLowFree = after.freeHeap + HEAP_PROBE_NEW_LOW_STEP_BYTES <= state.minFreeHeap;
+  bool newLowMax = after.maxBlock + HEAP_PROBE_NEW_LOW_STEP_BYTES <= state.minMaxBlock;
+  bool critical = after.freeHeap < HEAP_PROBE_CRITICAL_FREE_BYTES ||
+                  after.maxBlock < HEAP_PROBE_CRITICAL_MAX_BLOCK_BYTES;
+  bool forceLog = freeDrop || maxDrop || newLowFree || newLowMax;
+
+  if (after.freeHeap < state.minFreeHeap) state.minFreeHeap = after.freeHeap;
+  if (after.maxBlock < state.minMaxBlock) state.minMaxBlock = after.maxBlock;
+
+  if (!(freeDrop || maxDrop || newLowFree || newLowMax || critical)) return;
+
+  unsigned long now = millis();
+  if (state.lastLogMs != 0 &&
+      (long)(now - state.lastLogMs) < (long)HEAP_PROBE_LOG_COOLDOWN_MS &&
+      !forceLog) {
+    return;
+  }
+
+  char msg[64];
+  snprintf(
+    msg,
+    sizeof(msg),
+    "%s %lu/%lu>%lu/%lu",
+    tag,
+    (unsigned long)before.freeHeap,
+    (unsigned long)before.maxBlock,
+    (unsigned long)after.freeHeap,
+    (unsigned long)after.maxBlock
+  );
+  log_event(BUGLOG_WARN, code, msg);
+  state.lastLogMs = now;
+}
+
+class ScopedHeapProbe {
+public:
+  ScopedHeapProbe(const char *tag, uint16_t code, HeapProbeState &state)
+      : tag_(tag), code_(code), state_(state), before_(captureHeapSnapshot()) {}
+
+  ~ScopedHeapProbe() {
+    maybeLogHeapProbe(tag_, code_, state_, before_);
+  }
+
+private:
+  const char *tag_;
+  uint16_t code_;
+  HeapProbeState &state_;
+  HeapSnapshot before_;
+};
+
+void logBootStageSnapshot(const char *tag, uint16_t code) {
+  HeapSnapshot snap = captureHeapSnapshot();
+  char msg[64];
+  snprintf(
+    msg,
+    sizeof(msg),
+    "%s fh=%lu mb=%lu",
+    tag,
+    (unsigned long)snap.freeHeap,
+    (unsigned long)snap.maxBlock
+  );
+  bool anomaly = snap.freeHeap < BUGLOG_HEARTBEAT_LOW_FREE_HEAP_BYTES ||
+                 snap.maxBlock < TELEGRAM_MIN_MAX_BLOCK_BYTES;
+  log_event(anomaly ? BUGLOG_WARN : BUGLOG_INFO, code, msg);
+}
+
+void maybeLogTelegramStageSnapshot(const char *tag, uint16_t code, uint32_t ordinal) {
+  HeapSnapshot snap = captureHeapSnapshot();
+  bool anomaly = snap.freeHeap < BUGLOG_HEARTBEAT_LOW_FREE_HEAP_BYTES ||
+                 snap.maxBlock < TELEGRAM_MIN_MAX_BLOCK_BYTES;
+  if (!anomaly && ordinal > 2U) return;
+
+  char msg[64];
+  snprintf(
+    msg,
+    sizeof(msg),
+    "%s n=%lu fh=%lu mb=%lu",
+    tag,
+    (unsigned long)ordinal,
+    (unsigned long)snap.freeHeap,
+    (unsigned long)snap.maxBlock
+  );
+  log_event(anomaly ? BUGLOG_WARN : BUGLOG_INFO, code, msg);
+}
+
+class ScopedTelegramHttpInFlight {
+public:
+  ScopedTelegramHttpInFlight() { telegramHttpInFlight = true; }
+  ~ScopedTelegramHttpInFlight() { telegramHttpInFlight = false; }
+};
 
 bool debugSerialReady() {
 #if ARDUINO_USB_CDC_ON_BOOT
@@ -395,6 +588,15 @@ String telegramNotifyReasonSnapshot() {
   return String(local);
 }
 
+String nodeRedReportReasonSnapshot() {
+  char local[sizeof(nodeRedReportReasonBuf)];
+  portENTER_CRITICAL(&telegramStateMux);
+  memcpy(local, nodeRedReportReasonBuf, sizeof(local));
+  portEXIT_CRITICAL(&telegramStateMux);
+  local[sizeof(local) - 1] = '\0';
+  return String(local);
+}
+
 void setTelegramNotifyState(const String &reason, unsigned long dueMs) {
   portENTER_CRITICAL(&telegramStateMux);
   telegramNotifyPending = true;
@@ -403,9 +605,25 @@ void setTelegramNotifyState(const String &reason, unsigned long dueMs) {
   portEXIT_CRITICAL(&telegramStateMux);
 }
 
+void setNodeRedReportState(const String &reason, unsigned long dueMs) {
+  portENTER_CRITICAL(&telegramStateMux);
+  nodeRedReportPending = true;
+  copyReasonString(nodeRedReportReasonBuf, sizeof(nodeRedReportReasonBuf), reason);
+  nodeRedReportDueMs = dueMs;
+  portEXIT_CRITICAL(&telegramStateMux);
+}
+
 void clearTelegramNotifyPending() {
   portENTER_CRITICAL(&telegramStateMux);
   telegramNotifyPending = false;
+  portEXIT_CRITICAL(&telegramStateMux);
+}
+
+void clearNodeRedReportState() {
+  portENTER_CRITICAL(&telegramStateMux);
+  nodeRedReportPending = false;
+  nodeRedReportReasonBuf[0] = '\0';
+  nodeRedReportDueMs = 0;
   portEXIT_CRITICAL(&telegramStateMux);
 }
 
@@ -416,6 +634,23 @@ String telegramWebhookRecoveryReasonSnapshot() {
   portEXIT_CRITICAL(&telegramStateMux);
   local[sizeof(local) - 1] = '\0';
   return String(local);
+}
+
+String telegramHeapRecoveryReasonSnapshot() {
+  char local[sizeof(telegramHeapRecoveryReasonBuf)];
+  portENTER_CRITICAL(&telegramStateMux);
+  memcpy(local, telegramHeapRecoveryReasonBuf, sizeof(local));
+  portEXIT_CRITICAL(&telegramStateMux);
+  local[sizeof(local) - 1] = '\0';
+  return String(local);
+}
+
+uint16_t telegramHeapRecoveryCodeSnapshot() {
+  uint16_t code = 1313;
+  portENTER_CRITICAL(&telegramStateMux);
+  code = telegramHeapRecoveryReasonCode;
+  portEXIT_CRITICAL(&telegramStateMux);
+  return code;
 }
 
 void setTelegramWebhookRecoveryState(const String &reason, unsigned long notBeforeMs) {
@@ -486,9 +721,10 @@ void maybeLogPersistentHeartbeat() {
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t maxBlock = ESP.getMaxAllocHeap();
   bool telegramStale = telegramTaskHandle != nullptr && telegramAgeMs > BUGLOG_HEARTBEAT_STALE_TASK_MS;
+  bool telegramBusy = telegramHttpInFlight;
   bool anomaly = !wifiConnected() ||
-                 freeHeap < BUGLOG_HEARTBEAT_LOW_FREE_HEAP_BYTES ||
-                 maxBlock < TELEGRAM_MIN_MAX_BLOCK_BYTES ||
+                 (!telegramBusy && freeHeap < BUGLOG_HEARTBEAT_LOW_FREE_HEAP_BYTES) ||
+                 (!telegramBusy && maxBlock < TELEGRAM_MIN_MAX_BLOCK_BYTES) ||
                  telegramStale;
 
   char msg[64];
@@ -516,6 +752,7 @@ void clearWebLogs() {
 }
 
 String webLogsJson(int limit = 30) {
+  ScopedHeapProbe heapProbe("web_log", 1604, heapProbeWebLogs);
   if (limit <= 0) limit = 1;
   if (limit > WEB_LOG_CAPACITY) limit = WEB_LOG_CAPACITY;
   if (!lockLogs()) return "{\"ok\":false,\"error\":\"log_busy\"}";
@@ -861,31 +1098,95 @@ void restoreRunningPartitionBootTarget() {
 
 // Low-level Telegram API helpers ??? caller MUST hold telegramHttpMutex.
 // Crea un WiFiClientSecure locale per ogni richiesta (pattern ufficiale ESP32 3.x).
-// Ritorna il body HTTP (anche in errore, se disponibile). Aggiorna tgLastHttpCode.
-static bool tgParseApiResponse(const String &resp, bool &okOut, String &descOut) {
-  okOut = false;
-  descOut = "";
-  if (resp.length() == 0) return false;
-
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, resp);
-  if (err != DeserializationError::Ok) return false;
-
-  if (doc["ok"].is<bool>()) okOut = doc["ok"].as<bool>();
-  if (doc["description"].is<const char *>()) {
-    descOut = String(doc["description"].as<const char *>());
-  } else if (doc["description"].is<String>()) {
-    descOut = doc["description"].as<String>();
+static void copyCStringTrunc(char *dest, size_t destSize, const char *src) {
+  if (dest == nullptr || destSize == 0) return;
+  if (src == nullptr) {
+    dest[0] = '\0';
+    return;
   }
+
+  size_t i = 0;
+  for (; i + 1 < destSize && src[i] != '\0'; ++i) dest[i] = src[i];
+  dest[i] = '\0';
+}
+
+static void tgBuildPath(char *path, size_t pathSize, const char *method, const char *params = nullptr) {
+  if (path == nullptr || pathSize == 0) return;
+  path[0] = '\0';
+  if (method == nullptr || method[0] == '\0') return;
+
+  const int written = snprintf(
+    path,
+    pathSize,
+    "%s%s%s%s%s",
+    "/bot",
+    TELEGRAM_BOT_TOKEN,
+    "/",
+    method,
+    (params != nullptr && params[0] != '\0') ? "?" : ""
+  );
+
+  if (written < 0 || (size_t)written >= pathSize) {
+    path[pathSize - 1] = '\0';
+    return;
+  }
+
+  if (params != nullptr && params[0] != '\0') {
+    const size_t used = (size_t)written;
+    snprintf(path + used, pathSize - used, "%s", params);
+  }
+}
+
+static bool tgSerializeJsonBody(const JsonDocument &doc, char *body, size_t bodySize, size_t &bodyLen) {
+  if (body == nullptr || bodySize == 0) {
+    setTgLastError("json_body_null");
+    return false;
+  }
+  bodyLen = measureJson(doc);
+  if (bodyLen == 0 || bodyLen >= bodySize) {
+    setTgLastError("json_body_oversize");
+    return false;
+  }
+  serializeJson(doc, body, bodySize);
   return true;
 }
 
-static bool tgResponseOk(const String &resp, String *descOut = nullptr) {
-  bool ok = false;
-  String desc;
-  bool parsed = tgParseApiResponse(resp, ok, desc);
-  if (descOut != nullptr) *descOut = parsed ? desc : "";
-  return parsed && ok;
+struct PsramJsonAllocator {
+  void *allocate(size_t size) {
+    if (psramFound()) {
+      void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (ptr != nullptr) return ptr;
+    }
+    return malloc(size);
+  }
+
+  void deallocate(void *ptr) {
+    if (ptr != nullptr) heap_caps_free(ptr);
+  }
+
+  void *reallocate(void *ptr, size_t new_size) {
+    if (psramFound()) {
+      void *moved = heap_caps_realloc(ptr, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (moved != nullptr) return moved;
+    }
+    return realloc(ptr, new_size);
+  }
+};
+
+static bool tgParseApiDoc(const JsonDocument &doc, bool &okOut, char *descOut = nullptr, size_t descOutSize = 0, long *messageIdOut = nullptr) {
+  okOut = false;
+  if (descOut != nullptr && descOutSize > 0) descOut[0] = '\0';
+  if (messageIdOut != nullptr) *messageIdOut = 0;
+
+  if (doc["ok"].is<bool>()) okOut = doc["ok"].as<bool>();
+  const char *desc = doc["description"] | "";
+  if (descOut != nullptr && descOutSize > 0 && desc[0] != '\0') {
+    copyCStringTrunc(descOut, descOutSize, desc);
+  }
+  if (messageIdOut != nullptr) {
+    *messageIdOut = doc["result"]["message_id"] | 0L;
+  }
+  return doc["ok"].is<bool>() || (descOut != nullptr && descOut[0] != '\0');
 }
 
 static bool tgDescriptionContains(const String &desc, const char *needle) {
@@ -904,64 +1205,90 @@ static void tgConfigureClient(WiFiClientSecure &client, int ioTimeoutMs = 20000)
   client.setConnectionTimeout((uint32_t)TELEGRAM_HTTP_CONNECT_TIMEOUT_MS);  // TCP connect timeout
 }
 
-static String tgPost(const char *method, const String &body, int timeoutMs) {
+static bool tgPostJson(const char *method, const uint8_t *body, size_t bodyLen, int timeoutMs, JsonDocument &doc, bool &bodyPresent, JsonDocument *filterDoc = nullptr) {
   setTgLastError("");
-  String path = String("/bot") + TELEGRAM_BOT_TOKEN + "/" + method;
+  bodyPresent = false;
+  char path[TELEGRAM_API_PATH_CAPACITY];
+  tgBuildPath(path, sizeof(path), method);
   WiFiClientSecure client;
   tgConfigureClient(client, timeoutMs + 2000);
   HTTPClient http;
+  ScopedTelegramHttpInFlight httpInFlight;
   if (!http.begin(client, "api.telegram.org", 443, path, true)) {
     tgLastHttpCode = -1;
     setTgLastError("http_begin_failed");
-    return "";
+    return false;
   }
+  http.useHTTP10(true);
   http.setReuse(false);
   http.setTimeout(timeoutMs);
   http.addHeader("Content-Type", "application/json");
-  tgLastHttpCode = http.POST(body);
-  String resp = http.getString();
-  if (resp.length() > 0) {
-    bool ok = false;
-    String desc;
-    if (tgParseApiResponse(resp, ok, desc) && !ok && desc.length() > 0) {
-      setTgLastError(desc.c_str());
+  tgLastHttpCode = http.sendRequest("POST", const_cast<uint8_t *>(body), bodyLen);
+  bool parsed = false;
+  if (tgLastHttpCode > 0) {
+    Stream &stream = http.getStream();
+    DeserializationError err = filterDoc != nullptr
+      ? deserializeJson(doc, stream, DeserializationOption::Filter(*filterDoc))
+      : deserializeJson(doc, stream);
+    if (err == DeserializationError::Ok) {
+      parsed = true;
+      bodyPresent = true;
+      bool ok = false;
+      char desc[TELEGRAM_API_DESC_CAPACITY];
+      if (tgParseApiDoc(doc, ok, desc, sizeof(desc)) && !ok && desc[0] != '\0') {
+        setTgLastError(desc);
+      }
+    } else if (err != DeserializationError::EmptyInput) {
+      setTgLastError(err.c_str());
     }
   }
   if (tgLastErrorDescriptionBuf[0] == '\0' && tgLastHttpCode != 200) {
     setTgLastError(("http_" + String(tgLastHttpCode)).c_str());
   }
   http.end();
-  return resp;
+  return parsed;
 }
 
-static String tgGet(const char *method, const String &params, int timeoutMs) {
+static bool tgGetJson(const char *method, const char *params, int timeoutMs, JsonDocument &doc, bool &bodyPresent, JsonDocument *filterDoc = nullptr) {
   setTgLastError("");
-  String path = String("/bot") + TELEGRAM_BOT_TOKEN + "/" + method;
-  if (params.length() > 0) { path += "?"; path += params; }
+  bodyPresent = false;
+  char path[TELEGRAM_API_PATH_CAPACITY];
+  tgBuildPath(path, sizeof(path), method, params);
   WiFiClientSecure client;
   tgConfigureClient(client, timeoutMs + 2000);
   HTTPClient http;
+  ScopedTelegramHttpInFlight httpInFlight;
   if (!http.begin(client, "api.telegram.org", 443, path, true)) {
     tgLastHttpCode = -1;
     setTgLastError("http_begin_failed");
-    return "";
+    return false;
   }
+  http.useHTTP10(true);
   http.setReuse(false);
   http.setTimeout(timeoutMs);
   tgLastHttpCode = http.GET();
-  String resp = http.getString();
-  if (resp.length() > 0) {
-    bool ok = false;
-    String desc;
-    if (tgParseApiResponse(resp, ok, desc) && !ok && desc.length() > 0) {
-      setTgLastError(desc.c_str());
+  bool parsed = false;
+  if (tgLastHttpCode > 0) {
+    Stream &stream = http.getStream();
+    DeserializationError err = filterDoc != nullptr
+      ? deserializeJson(doc, stream, DeserializationOption::Filter(*filterDoc))
+      : deserializeJson(doc, stream);
+    if (err == DeserializationError::Ok) {
+      parsed = true;
+      bodyPresent = true;
+      if (doc["ok"].is<bool>() && !doc["ok"].as<bool>()) {
+        const char *desc = doc["description"] | "";
+        if (desc[0] != '\0') setTgLastError(desc);
+      }
+    } else if (err != DeserializationError::EmptyInput) {
+      setTgLastError(err.c_str());
     }
   }
   if (tgLastErrorDescriptionBuf[0] == '\0' && tgLastHttpCode != 200) {
     setTgLastError(("http_" + String(tgLastHttpCode)).c_str());
   }
   http.end();
-  return resp;
+  return parsed;
 }
 
 String telegramInlineKeyboardJson() {
@@ -997,6 +1324,7 @@ String telegramConfirmKeyboardJson(uint32_t nonce) {
 }
 
 void scheduleTelegramWebhookRecovery(const String &reason, unsigned long delayMs = 0) {
+  if (!telegramConfigured()) return;
   setTelegramWebhookRecoveryState(reason, millis() + delayMs);
 }
 
@@ -1014,18 +1342,28 @@ bool tryTelegramDeleteWebhook(bool dropPendingUpdates, const String &reason) {
     return false;
   }
 
-  JsonDocument req;
+  ScopedHeapProbe heapProbe("tg_rcv", 1602, heapProbeTelegramRecovery);
+  BasicJsonDocument<PsramJsonAllocator> req(TELEGRAM_SMALL_JSON_CAPACITY);
   req["drop_pending_updates"] = dropPendingUpdates;
-  String body;
-  serializeJson(req, body);
-  String resp = tgPost("deleteWebhook", body, (int)TELEGRAM_WEBHOOK_HTTP_TIMEOUT_MS);
+  char body[TELEGRAM_SMALL_BODY_CAPACITY];
+  size_t bodyLen = 0;
+  bool serialized = tgSerializeJsonBody(req, body, sizeof(body), bodyLen);
+  BasicJsonDocument<PsramJsonAllocator> respDoc(TELEGRAM_SMALL_JSON_CAPACITY);
+  bool bodyPresent = false;
+  bool parsed = false;
+  if (serialized) {
+    parsed = tgPostJson("deleteWebhook", reinterpret_cast<uint8_t *>(body), bodyLen, (int)TELEGRAM_WEBHOOK_HTTP_TIMEOUT_MS, respDoc, bodyPresent);
+  }
   xSemaphoreGive(telegramHttpMutex);
 
-  String desc;
-  bool ok = tgResponseOk(resp, &desc);
+  bool apiOk = false;
+  char desc[TELEGRAM_API_DESC_CAPACITY];
+  bool parsedReply = parsed && bodyPresent && tgParseApiDoc(respDoc, apiOk, desc, sizeof(desc));
+  bool ok = parsedReply && apiOk;
   if (ok) {
     telegramMetricWebhookRecoveries++;
     telegramLastWebhookRecoveryMs = millis();
+    maybeLogTelegramStageSnapshot("tg_rec_ok", 1625, telegramMetricWebhookRecoveries);
     logLine("[TG][RECOVERY] deleteWebhook OK (" + reason + ")");
     telegramRegisterSuccess();
     return true;
@@ -1071,6 +1409,7 @@ void persistTelegramOffsetIfNeeded(bool force = false) {
 }
 
 void scheduleTelegramNotification(const String &reason, unsigned long delayMs = 0) {
+  if (!telegramConfigured()) return;
   if (reason == "boot" &&
       (telegramBootNotifyAttempted || telegramBootNotifyAttempts >= TELEGRAM_BOOT_NOTIFY_RETRY_MAX)) return;
   setTelegramNotifyState(reason, millis() + delayMs);
@@ -1092,6 +1431,7 @@ bool sendTelegramMessageEx(const String &text, long replyMessageId = 0, const St
     return false;
   }
 
+  ScopedHeapProbe heapProbe("tg_send", 1601, heapProbeTelegramSend);
   if (TELEGRAM_NET_DIAG_VERBOSE) {
     IPAddress resolvedIP;
     int dnsResult = WiFi.hostByName("api.telegram.org", resolvedIP);
@@ -1131,30 +1471,49 @@ bool sendTelegramMessageEx(const String &text, long replyMessageId = 0, const St
         continue;
       }
 
-      JsonDocument reqDoc;
+      BasicJsonDocument<PsramJsonAllocator> reqDoc(TELEGRAM_SEND_JSON_CAPACITY);
       reqDoc["chat_id"] = TELEGRAM_CHAT_ID;
       reqDoc["text"] = text;
       if (replyMessageId > 0) reqDoc["reply_to_message_id"] = replyMessageId;
+      String wrappedMarkup;
       if (includeKeyboard && markup.length() > 0) {
-        reqDoc["reply_markup"] = serialized(String("{\"inline_keyboard\":") + markup + "}");
+        wrappedMarkup.reserve(markup.length() + 24);
+        wrappedMarkup = "{\"inline_keyboard\":";
+        wrappedMarkup += markup;
+        wrappedMarkup += "}";
+        reqDoc["reply_markup"] = serialized(wrappedMarkup);
       }
-      String body;
-      serializeJson(reqDoc, body);
-      String resp = tgPost("sendMessage", body, sendTimeoutMs);
+      char body[TELEGRAM_SEND_BODY_CAPACITY];
+      size_t bodyLen = 0;
+      bool serialized = tgSerializeJsonBody(reqDoc, body, sizeof(body), bodyLen);
+      BasicJsonDocument<PsramJsonAllocator> respFilter(TELEGRAM_SMALL_JSON_CAPACITY);
+      respFilter["ok"] = true;
+      respFilter["description"] = true;
+      respFilter["result"]["message_id"] = true;
+      BasicJsonDocument<PsramJsonAllocator> respDoc(TELEGRAM_SMALL_JSON_CAPACITY);
+      bool bodyPresent = false;
+      bool parsed = false;
+      if (serialized) {
+        parsed = tgPostJson("sendMessage", reinterpret_cast<uint8_t *>(body), bodyLen, sendTimeoutMs, respDoc, bodyPresent, &respFilter);
+      }
       xSemaphoreGive(telegramHttpMutex);
 
-      String desc;
-      if (tgResponseOk(resp, &desc)) {
-        JsonDocument respDoc;
-        if (deserializeJson(respDoc, resp) == DeserializationError::Ok) {
-          long msgId = respDoc["result"]["message_id"].as<long>();
-          if (msgId > 0) telegramConsoleMessageId = msgId;
-        }
+      bool apiOk = false;
+      char desc[TELEGRAM_API_DESC_CAPACITY];
+      long msgId = 0;
+      bool parsedReply = parsed && bodyPresent && tgParseApiDoc(respDoc, apiOk, desc, sizeof(desc), &msgId);
+      if (parsedReply && apiOk) {
+        if (msgId > 0) telegramConsoleMessageId = msgId;
         ok = true;
         break;
       }
 
-      lastSendError = desc.length() > 0 ? desc : String(tgLastErrorDescriptionBuf);
+      if (!serialized) lastSendError = "json_body_oversize";
+      else if (!bodyPresent) lastSendError = "empty_body";
+      else if (desc[0] != '\0') lastSendError = desc;
+      else if (tgLastErrorDescriptionBuf[0] != '\0') lastSendError = String(tgLastErrorDescriptionBuf);
+      else if (!parsedReply) lastSendError = "api_parse";
+      else lastSendError = "api_ko";
       if (attempt < sendAttempts) {
         logLine("[TG][SEND] tentativo " + String(attempt) + "/" + String(sendAttempts) +
                 " fallito (HTTP " + String(tgLastHttpCode) + ")");
@@ -1173,6 +1532,7 @@ bool sendTelegramMessageEx(const String &text, long replyMessageId = 0, const St
   } else {
     telegramMetricSendOk++;
     telegramLastSendOkMs = millis();
+    maybeLogTelegramStageSnapshot("tg_send_ok", 1626, telegramMetricSendOk);
     telegramRegisterSuccess();
   }
   return ok;
@@ -1188,13 +1548,20 @@ bool deleteTelegramMessage(long messageId) {
   if (!wifiConnected()) return false;
   if (telegramHttpMutex == nullptr) return false;
   if (xSemaphoreTake(telegramHttpMutex, pdMS_TO_TICKS(2500)) != pdTRUE) return false;
-  JsonDocument doc;
+  BasicJsonDocument<PsramJsonAllocator> doc(TELEGRAM_SMALL_JSON_CAPACITY);
   doc["chat_id"] = TELEGRAM_CHAT_ID;
   doc["message_id"] = messageId;
-  String body;
-  serializeJson(doc, body);
-  String resp = tgPost("deleteMessage", body, (int)TELEGRAM_SHORT_HTTP_TIMEOUT_MS);
-  bool ok = tgResponseOk(resp);
+  char body[TELEGRAM_SMALL_BODY_CAPACITY];
+  size_t bodyLen = 0;
+  bool serialized = tgSerializeJsonBody(doc, body, sizeof(body), bodyLen);
+  BasicJsonDocument<PsramJsonAllocator> respDoc(TELEGRAM_SMALL_JSON_CAPACITY);
+  bool bodyPresent = false;
+  bool parsed = false;
+  if (serialized) {
+    parsed = tgPostJson("deleteMessage", reinterpret_cast<uint8_t *>(body), bodyLen, (int)TELEGRAM_SHORT_HTTP_TIMEOUT_MS, respDoc, bodyPresent);
+  }
+  bool apiOk = false;
+  bool ok = parsed && bodyPresent && tgParseApiDoc(respDoc, apiOk) && apiOk;
   xSemaphoreGive(telegramHttpMutex);
   if (!ok) {
     logLine("[TG][DELETE] KO message_id=" + String(messageId) + " HTTP " + String(tgLastHttpCode) +
@@ -1208,13 +1575,20 @@ bool answerTelegramCallback(const String &callbackId, const String &text = "") {
   if (!wifiConnected()) return false;
   if (telegramHttpMutex == nullptr) return false;
   if (xSemaphoreTake(telegramHttpMutex, pdMS_TO_TICKS(2500)) != pdTRUE) return false;
-  JsonDocument doc;
+  BasicJsonDocument<PsramJsonAllocator> doc(TELEGRAM_SMALL_JSON_CAPACITY);
   doc["callback_query_id"] = callbackId;
   if (text.length() > 0) doc["text"] = text;
-  String body;
-  serializeJson(doc, body);
-  String resp = tgPost("answerCallbackQuery", body, (int)TELEGRAM_SHORT_HTTP_TIMEOUT_MS);
-  bool ok = tgResponseOk(resp);
+  char body[TELEGRAM_SMALL_BODY_CAPACITY];
+  size_t bodyLen = 0;
+  bool serialized = tgSerializeJsonBody(doc, body, sizeof(body), bodyLen);
+  BasicJsonDocument<PsramJsonAllocator> respDoc(TELEGRAM_SMALL_JSON_CAPACITY);
+  bool bodyPresent = false;
+  bool parsed = false;
+  if (serialized) {
+    parsed = tgPostJson("answerCallbackQuery", reinterpret_cast<uint8_t *>(body), bodyLen, (int)TELEGRAM_SHORT_HTTP_TIMEOUT_MS, respDoc, bodyPresent);
+  }
+  bool apiOk = false;
+  bool ok = parsed && bodyPresent && tgParseApiDoc(respDoc, apiOk) && apiOk;
   xSemaphoreGive(telegramHttpMutex);
   if (!ok) {
     logLine("[TG][CALLBACK] KO HTTP " + String(tgLastHttpCode) +
@@ -1306,6 +1680,50 @@ bool telegramInFailsafePause() {
   return (long)(millis() - telegramFailsafeUntilMs) < 0;
 }
 
+void requestTelegramHeapRecovery(
+  uint32_t freeHeap,
+  uint32_t maxBlock,
+  const char *reason = "heap_guard",
+  uint16_t logCode = 1313
+) {
+  portENTER_CRITICAL(&telegramStateMux);
+  telegramHeapRecoveryRequested = true;
+  telegramHeapRecoveryFreeHeap = freeHeap;
+  telegramHeapRecoveryMaxBlock = maxBlock;
+  telegramHeapRecoveryReasonCode = logCode;
+  if (reason == nullptr || reason[0] == '\0') {
+    telegramHeapRecoveryReasonBuf[0] = '\0';
+  } else {
+    size_t i = 0;
+    for (; i + 1 < sizeof(telegramHeapRecoveryReasonBuf) && reason[i] != '\0'; ++i) {
+      telegramHeapRecoveryReasonBuf[i] = reason[i];
+    }
+    telegramHeapRecoveryReasonBuf[i] = '\0';
+  }
+  portEXIT_CRITICAL(&telegramStateMux);
+
+  unsigned long now = millis();
+  if (telegramHeapRecoveryLastLogMs != 0 &&
+      (long)(now - telegramHeapRecoveryLastLogMs) < 30000L) {
+    return;
+  }
+
+  char msg[64];
+  snprintf(
+    msg,
+    sizeof(msg),
+    "%s fh=%lu mb=%lu",
+    (reason != nullptr && reason[0] != '\0') ? reason : "heap_guard",
+    (unsigned long)freeHeap,
+    (unsigned long)maxBlock
+  );
+  log_event(BUGLOG_WARN, logCode, msg);
+  logLine("[TG] Recovery richiesto (" +
+          String((reason != nullptr && reason[0] != '\0') ? reason : "heap_guard") +
+          "): fh=" + String(freeHeap) + " mb=" + String(maxBlock));
+  telegramHeapRecoveryLastLogMs = now;
+}
+
 bool telegramInBackoff() {
   if (telegramBackoffUntilMs == 0) return false;
   return (long)(millis() - telegramBackoffUntilMs) < 0;
@@ -1342,6 +1760,13 @@ void clearTelegramRuntimeState(bool resetPersistedOffset = false) {
   telegramConsecutiveErrors = 0;
   telegramBackoffUntilMs = 0;
   telegramFailsafeUntilMs = 0;
+  telegramHeapRecoveryRequested = false;
+  telegramHeapRecoveryFreeHeap = 0;
+  telegramHeapRecoveryMaxBlock = 0;
+  telegramHeapRecoveryLastLogMs = 0;
+  telegramPollOkSinceRestart = 0;
+  telegramHeapRecoveryReasonCode = 1313;
+  telegramHeapRecoveryReasonBuf[0] = '\0';
   telegramNotifyPending = false;
   telegramNextTryMs = 0;
   telegramWebhookRecoveryPending = false;
@@ -1394,6 +1819,7 @@ bool startTelegramTask(const char *reason = nullptr) {
   }
 
   telegramTaskLastRestartMs = millis();
+  telegramPollOkSinceRestart = 0;
   if (reason != nullptr && reason[0] != '\0') {
     logLine("[TG] Task avviato (" + String(reason) + ")");
   } else {
@@ -1422,7 +1848,8 @@ bool restartTelegramTask(const String &reason, bool resetPersistedOffset = false
   logLine("[TG] Recovery task (" + reasonText + (resetPersistedOffset ? ", reset offset" : "") + ")");
 
   bool started = startTelegramTask(reasonText.c_str());
-  if (started && telegramConfigured()) {
+  if (started && telegramConfigured() &&
+      (resetPersistedOffset || TELEGRAM_AUTO_RECOVERY_FOLLOWUP_ENABLED)) {
     scheduleTelegramWebhookRecovery(resetPersistedOffset ? "manual_reset_offset" : "task_recover", 200);
     scheduleTelegramNotification(resetPersistedOffset ? "tg_recover_offset" : "tg_recover", 1200);
   }
@@ -1439,6 +1866,26 @@ void maybeRecoverTelegramTask() {
     return;
   }
 
+  if (telegramHeapRecoveryRequested) {
+    if (telegramTaskLastRestartMs == 0 ||
+        (long)(now - telegramTaskLastRestartMs) >= (long)TELEGRAM_HEAP_RECOVERY_RESTART_COOLDOWN_MS) {
+      String recoveryReason = telegramHeapRecoveryReasonSnapshot();
+      char reason[64];
+      snprintf(
+        reason,
+        sizeof(reason),
+        "%s fh=%lu mb=%lu",
+        recoveryReason.length() > 0 ? recoveryReason.c_str() : "heap_guard",
+        (unsigned long)telegramHeapRecoveryFreeHeap,
+        (unsigned long)telegramHeapRecoveryMaxBlock
+      );
+      if (restartTelegramTask(String(reason))) {
+        telegramHeapRecoveryRequested = false;
+      }
+    }
+    return;
+  }
+
   if (telegramHeartbeatMs == 0) return;
   unsigned long heartbeatAgeMs = now - telegramHeartbeatMs;
   if (heartbeatAgeMs < TELEGRAM_TASK_STALE_RESTART_MS) return;
@@ -1448,7 +1895,25 @@ void maybeRecoverTelegramTask() {
   restartTelegramTask("stale_heartbeat");
 }
 
+void maybeRequestTelegramSoftRecycle() {
+  uint32_t freeHeapAfterPoll = ESP.getFreeHeap();
+  uint32_t maxBlockAfterPoll = ESP.getMaxAllocHeap();
+  bool recycleForHeap = maxBlockAfterPoll < TELEGRAM_SOFT_RECYCLE_MAX_BLOCK_BYTES;
+  bool recycleForPollBudget = telegramPollOkSinceRestart >= TELEGRAM_SOFT_RECYCLE_POLL_OK_LIMIT;
+  bool recycleForTaskAge =
+    telegramTaskLastRestartMs != 0 &&
+    (long)(millis() - telegramTaskLastRestartMs) >= (long)TELEGRAM_SOFT_RECYCLE_TASK_AGE_MS;
+  if (!recycleForHeap && !recycleForPollBudget && !recycleForTaskAge) return;
+
+  const char *recycleReason =
+    recycleForHeap ? "soft_recycle" :
+    (recycleForPollBudget ? "poll_budget" : "task_age");
+  requestTelegramHeapRecovery(freeHeapAfterPoll, maxBlockAfterPoll, recycleReason, 1314);
+  telegramFailsafeUntilMs = millis() + TELEGRAM_SOFT_RECYCLE_PAUSE_MS;
+}
+
 String deviceStatusMessage() {
+  ScopedHeapProbe heapProbe("tg_stat", 1606, heapProbeTelegramStatusMsg);
   ensureTimeSynced(TIME_SYNC_TIMEOUT_MS);
 
   int rssi = WiFi.RSSI();
@@ -1647,14 +2112,32 @@ bool processTelegramCommands() {
     return false;
   }
 
+  ScopedHeapProbe heapProbe("tg_poll", 1600, heapProbeTelegramPoll);
   int readTimeoutMs = (int)(pollTimeoutSec * 1000UL + TELEGRAM_LONG_POLL_GRACE_MS);
 
-  String params = "offset=" + String(telegramLastUpdateId + 1)
-    + "&timeout=" + String(pollTimeoutSec)
-    + "&limit=3"
-    + "&allowed_updates=%5B%22message%22%5D";
+  char params[96];
+  snprintf(
+    params,
+    sizeof(params),
+    "offset=%ld&timeout=%d&limit=%u&allowed_updates=%%5B%%22message%%22%%5D",
+    telegramLastUpdateId + 1,
+    pollTimeoutSec,
+    (unsigned)TELEGRAM_POLL_RESULT_LIMIT
+  );
 
-  String resp = tgGet("getUpdates", params, readTimeoutMs);
+  BasicJsonDocument<PsramJsonAllocator> filter(TELEGRAM_POLL_FILTER_JSON_CAPACITY);
+  filter["ok"] = true;
+  JsonArray filterResults = filter["result"].to<JsonArray>();
+  JsonObject filterUpdate = filterResults.add<JsonObject>();
+  filterUpdate["update_id"] = true;
+  JsonObject filterMessage = filterUpdate["message"].to<JsonObject>();
+  filterMessage["message_id"] = true;
+  filterMessage["text"] = true;
+  filterMessage["chat"]["id"] = true;
+
+  BasicJsonDocument<PsramJsonAllocator> doc(TELEGRAM_POLL_JSON_CAPACITY);
+  bool bodyPresent = false;
+  bool parsed = tgGetJson("getUpdates", params, readTimeoutMs, doc, bodyPresent, &filter);
   xSemaphoreGive(telegramHttpMutex);
   markTelegramHeartbeat();
 
@@ -1693,7 +2176,7 @@ bool processTelegramCommands() {
     return false;
   }
 
-  if (resp.length() == 0) {
+  if (!bodyPresent) {
     telegramMetricPollKo++;
     logLine("[TG][POLL] risposta 200 ma body vuoto");
     telegramRegisterError("getUpdates_empty_200");
@@ -1701,8 +2184,7 @@ bool processTelegramCommands() {
     return false;
   }
 
-  JsonDocument doc;
-  if (deserializeJson(doc, resp) != DeserializationError::Ok || !doc["ok"].as<bool>()) {
+  if (!parsed || !doc["ok"].as<bool>()) {
     telegramMetricPollParseKo++;
     if (TELEGRAM_POLL_VERBOSE_LOG) logLine("[TG][POLL] parse error in " + String(elapsedMs) + " ms");
     telegramRegisterError("getUpdates_parse");
@@ -1712,7 +2194,9 @@ bool processTelegramCommands() {
 
   telegramRegisterSuccess();
   telegramMetricPollOk++;
+  if (telegramPollOkSinceRestart < 255) telegramPollOkSinceRestart++;
   telegramLastPollOkMs = millis();
+  maybeLogTelegramStageSnapshot("tg_poll_ok", 1627, telegramMetricPollOk);
 
   JsonArray results = doc["result"].as<JsonArray>();
   int numNewMessages = (int)results.size();
@@ -1721,6 +2205,7 @@ bool processTelegramCommands() {
     logLine("[TG][POLL] getUpdates messages=" + String(numNewMessages) + " in " + String(elapsedMs) + " ms");
 
   if (numNewMessages == 0) {
+    maybeRequestTelegramSoftRecycle();
     return false;
   }
 
@@ -1775,6 +2260,7 @@ bool processTelegramCommands() {
   }
 
   persistTelegramOffsetIfNeeded(false);
+  maybeRequestTelegramSoftRecycle();
   return handled;
 }
 
@@ -1797,7 +2283,15 @@ void telegramTask(void *parameter) {
     }
 
     if (wifiConnected() && telegramConfigured()) {
+      uint32_t freeHeap = ESP.getFreeHeap();
       uint32_t maxBlock = ESP.getMaxAllocHeap();
+      if (freeHeap < TELEGRAM_HEAP_RECOVERY_FREE_HEAP_BYTES ||
+          maxBlock < TELEGRAM_HEAP_RECOVERY_MAX_BLOCK_BYTES) {
+        requestTelegramHeapRecovery(freeHeap, maxBlock, "heap_guard", 1313);
+        telegramFailsafeUntilMs = millis() + TELEGRAM_HEAP_RECOVERY_PAUSE_MS;
+        vTaskDelay(pdMS_TO_TICKS(250));
+        continue;
+      }
       if (maxBlock < TELEGRAM_MIN_MAX_BLOCK_BYTES) {
         logLine("[TG] Heap frammentato, pausa " + String(TELEGRAM_LOW_HEAP_PAUSE_MS / 1000UL) + " s");
         telegramFailsafeUntilMs = millis() + TELEGRAM_LOW_HEAP_PAUSE_MS;
@@ -1969,6 +2463,79 @@ bool connectConfiguredWifi(unsigned long timeoutMs) {
 
   WiFi.disconnect();
   return false;
+}
+
+void scheduleNodeRedPresenceReport(const String &reason, unsigned long delayMs = 0) {
+  if (!nodeRedReportConfigured()) return;
+  setNodeRedReportState(reason, millis() + delayMs);
+}
+
+String nodeRedPresenceJson(const String &reason) {
+  String json;
+  json.reserve(320);
+  json += "{";
+  json += "\"reason\":\"" + jsonEscape(reason) + "\",";
+  json += "\"ip\":\"" + jsonEscape(WiFi.localIP().toString()) + "\",";
+  json += "\"host\":\"" + jsonEscape(String(WiFi.getHostname())) + "\",";
+  json += "\"fw\":\"" + jsonEscape(String(FW_VERSION)) + "\",";
+  json += "\"fw_full\":\"" + jsonEscape(firmwareVersionString()) + "\",";
+  json += "\"boot_id\":\"" + jsonEscape(bootSessionIdHex()) + "\",";
+  json += "\"running_partition\":\"" + jsonEscape(runningPartitionLabel()) + "\",";
+  json += "\"wifi_ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"rome_time\":\"" + jsonEscape(formatLocalTimeRome()) + "\"";
+  json += "}";
+  return json;
+}
+
+bool sendNodeRedPresenceReport(const String &reason) {
+  if (!nodeRedReportConfigured()) return false;
+  if (!wifiConnected()) return false;
+
+  WiFiClient client;
+  HTTPClient http;
+  if (!http.begin(client, NODERED_REPORT_URL)) {
+    logLine("[NR] Presence begin KO");
+    return false;
+  }
+
+  http.setConnectTimeout((int)NODERED_REPORT_TIMEOUT_MS);
+  http.setTimeout((int)NODERED_REPORT_TIMEOUT_MS);
+  http.addHeader("Content-Type", "application/json");
+  String body = nodeRedPresenceJson(reason);
+  int code = http.POST(body);
+  http.end();
+
+  if (code > 0 && code < 300) {
+    logLine("[NR] Presence report OK (" + reason + ")");
+    appendPersistentBootEvent("presence " + reason + " ip=" + WiFi.localIP().toString());
+    return true;
+  }
+
+  logLine("[NR] Presence report KO (" + reason + "), HTTP " + String(code));
+  return false;
+}
+
+void processNodeRedPresenceReport() {
+  if (!nodeRedReportPending) return;
+  if (!nodeRedReportConfigured()) {
+    clearNodeRedReportState();
+    return;
+  }
+  if (!wifiConnected() || otaUploadInProgress) return;
+
+  unsigned long dueMs = 0;
+  portENTER_CRITICAL(&telegramStateMux);
+  dueMs = nodeRedReportDueMs;
+  portEXIT_CRITICAL(&telegramStateMux);
+  if (dueMs != 0 && (long)(millis() - dueMs) < 0) return;
+
+  String reason = nodeRedReportReasonSnapshot();
+  if (sendNodeRedPresenceReport(reason)) {
+    clearNodeRedReportState();
+  } else {
+    setNodeRedReportState(reason, millis() + NODERED_REPORT_RETRY_MS);
+  }
 }
 
 // =====================
@@ -2152,6 +2719,7 @@ void sendText(int code, const String &body) {
 }
 
 String statusJson() {
+  ScopedHeapProbe heapProbe("st_json", 1603, heapProbeStatusJson);
   String json;
   json.reserve(2800);  // BUG-4 FIX: ~2.5 KB con tutti i campi; 1600 causava 1-2 riallocazioni heap
   int rssi = WiFi.RSSI();
@@ -2238,6 +2806,7 @@ String statusJson() {
 }
 
 String wifiScanJson() {
+  ScopedHeapProbe heapProbe("wf_scan", 1605, heapProbeWifiScan);
   if (!wifiScanPending) {
     WiFi.scanDelete();
     int scanStart = WiFi.scanNetworks(true, true);
@@ -2344,7 +2913,7 @@ R"HTML(
         <div class="panel"><h3>Comandi</h3><div class="config-row"><input id="pulseMsInput" type="number" min="50" step="10" placeholder="Pulse ms"><input id="forceMsInput" type="number" min="500" step="10" placeholder="Force ms"><button class="b-save" onclick="applyTimingsToDevice()">Salva</button></div><div class="buttons"><button id="pulseBtn" class="b-pulse" onclick="cmdPulse()">PULSE</button><button id="forceBtn" class="b-reset" onclick="cmdForceShutdown()">FORCE</button><button class="b-on" onclick="cmdTestOn()">TEST ON</button><button class="b-off" onclick="cmdTestOff()">TEST OFF</button><button class="b-reboot" onclick="cmdReboot()">REBOOT ESP</button><button class="b-ota" onclick="cmdOpenOta()">WEB OTA</button><button class="b-reset" onclick="cmdResetWifi()">RESET WIFI</button></div><div class="result" id="cmdResult">Pronto</div></div>
         <div class="panel"><h3>WiFi</h3><div class="wifi-row"><select id="wifiSelect" onchange="pickScannedWifi()"><option value="">Rete trovata</option></select><button class="b-save" onclick="scanWifiNetworks()">Scansiona</button></div><div class="wifi-row"><input id="wifiSsidInput" type="text" placeholder="SSID"><input id="wifiPassInput" type="password" placeholder="Password"><button class="b-save" onclick="applyWifiToDevice()">Salva</button></div><div class="api-note" id="wifiScanInfo">Le credenziali WiFi vengono inviate con POST e il reboot resta manuale.</div></div>
         <div class="panel"><h3>Log RAM</h3><div class="config-row"><button class="b-save" onclick="refreshLogs()">Aggiorna</button><button class="b-save" onclick="copyLogsToClipboard()">Copy</button><button class="b-reset" onclick="clearLogs()">Pulisci</button></div><div class="api-note">Questi log sono volatili e si perdono al reboot o al power cycle.</div><div class="result" id="logBox" style="white-space:pre-wrap;max-height:220px;overflow:auto">Nessun log.</div></div>
-        <div class="panel"><h3>Buglog Persistente</h3><div class="config-row"><button class="b-save" onclick="refreshBuglog()">Aggiorna</button><button class="b-save" onclick="copyBuglogToClipboard()">Copy</button><button class="b-reset" onclick="clearBuglog()">Pulisci</button></div><div class="api-note">Salvato in flash locale. Resta disponibile anche dopo reset e power cycle.</div><div class="buglog-layout"><div class="result" id="buglogBox" style="white-space:pre-wrap;max-height:220px;overflow:auto">Nessun buglog.</div><div class="legend"><div><b>Severity</b>: <code>INFO</code> = normale, <code>WARN</code> = anomalia, <code>ERROR</code> = errore, <code>FATAL</code> = reboot watchdog.</div><div style="margin-top:8px"><b>Code</b>: <code>1000</code> boot, <code>1001</code> crash reset, <code>1101</code> watchdog reboot, <code>1102</code> recovery/factory, <code>1201</code> reset WiFi, <code>1301</code>/<code>1302</code> task create fail, <code>1500</code> heartbeat ok, <code>1501</code> heartbeat anomalo.</div><div style="margin-top:8px"><b>Heartbeat</b>: ogni 15 minuti se tutto e normale, ogni 2 minuti se rileva una condizione sospetta.</div><div style="margin-top:8px"><b>Campi heartbeat</b>: <code>fh</code> = free heap disponibile, <code>mb</code> = blocco heap contiguo massimo allocabile, <code>wf</code> = WiFi connesso (<code>1</code>) o non connesso (<code>0</code>), <code>la</code> = eta ultimo heartbeat del loop principale in ms, <code>ta</code> = eta ultimo heartbeat del task Telegram in ms.</div></div></div></div>
+        <div class="panel"><h3>Buglog Persistente</h3><div class="config-row"><button class="b-save" onclick="refreshBuglog()">Aggiorna</button><button class="b-save" onclick="copyBuglogToClipboard()">Copy</button><button class="b-reset" onclick="clearBuglog()">Pulisci</button></div><div class="api-note">Salvato in flash locale. Resta disponibile anche dopo reset e power cycle.</div><div class="buglog-layout"><div class="result" id="buglogBox" style="white-space:pre-wrap;max-height:220px;overflow:auto">Nessun buglog.</div><div class="legend"><div><b>Severity</b>: <code>INFO</code> = normale, <code>WARN</code> = anomalia, <code>ERROR</code> = errore, <code>FATAL</code> = reboot watchdog.</div><div style="margin-top:8px"><b>Code</b>: <code>1000</code> boot, <code>1001</code> crash reset, <code>1101</code> watchdog reboot, <code>1102</code> recovery/factory, <code>1201</code> reset WiFi, <code>1301</code>/<code>1302</code> task create fail, <code>1310</code> task recovery, <code>1311</code> task recovery con reset offset, <code>1312</code> failsafe Telegram, <code>1313</code> heap_guard richiesto, <code>1500</code> heartbeat ok, <code>1501</code> heartbeat anomalo, <code>1600</code> tg_poll, <code>1601</code> tg_send, <code>1602</code> tg_recovery, <code>1603</code> status_json, <code>1604</code> web_logs, <code>1605</code> wifi_scan, <code>1606</code> tg_status_msg, <code>1610</code>/<code>1611</code>/<code>1612</code>/<code>1613</code>/<code>1614</code> boot_probe, <code>1620</code> boot_cfg snapshot, <code>1621</code> boot_wifi snapshot, <code>1622</code> boot_ntp snapshot, <code>1623</code> boot_http snapshot, <code>1624</code> boot_tasks snapshot, <code>1625</code> tg_recovery snapshot, <code>1626</code> tg_send snapshot, <code>1627</code> tg_poll snapshot.</div><div style="margin-top:8px"><b>Heartbeat</b>: ogni 15 minuti se tutto e normale, ogni 2 minuti se rileva una condizione sospetta.</div><div style="margin-top:8px"><b>Campi heartbeat</b>: <code>fh</code> = free heap disponibile, <code>mb</code> = blocco heap contiguo massimo allocabile, <code>wf</code> = WiFi connesso (<code>1</code>) o non connesso (<code>0</code>), <code>la</code> = eta ultimo heartbeat del loop principale in ms, <code>ta</code> = eta ultimo heartbeat del task Telegram in ms.</div><div style="margin-top:8px"><b>Campi probe heap</b>: formato <code>tag beforeFree/beforeMax&gt;afterFree/afterMax</code>. Esempio <code>tg_poll 68024/57332&gt;15980/7668</code> = il polling Telegram e uscito con heap molto piu basso di come era entrato.</div><div style="margin-top:8px"><b>Campi snapshot</b>: formato <code>tag n=... fh=... mb=...</code>. Servono a mostrare lo stato heap subito dopo recovery/send/poll e a fine fase boot.</div><div style="margin-top:8px"><b>Heap guard</b>: se <code>fh</code> scende sotto 22 KB o <code>mb</code> sotto 16 KB, il task Telegram si mette in pausa breve e il <code>loop()</code> prova un recovery controllato.</div></div></div></div>
       </div>
     </div>
 <div class="api-box"><h3>API</h3><div class="api-list"><div id="apiStatusLine">GET /api/status</div><div id="apiPulseLine">GET /api/pc/pulse</div><div id="apiForceLine">GET /api/pc/forceshutdown</div><div id="apiTestOnLine">GET /api/pc/test/on</div><div id="apiTestOffLine">GET /api/pc/test/off</div><div id="apiTimingsLine">GET /api/config/timings?pulse_ms=500&amp;force_ms=3000</div><div id="apiWifiScanLine">GET /api/wifi/scan</div><div id="apiWifiLine">POST /api/config/wifi (body: ssid=SSID&amp;password=PASSWORD)</div><div id="apiLogsLine">GET /api/logs?limit=30</div><div id="apiLogsClearLine">GET /api/logs/clear</div><div id="apiBuglogLine">GET /api/buglog</div><div id="apiBuglogClearLine">GET /api/buglog/clear</div><div id="apiBootHistoryLine">GET /api/boot-history?limit=12</div><div id="apiRebootLine">GET /api/reboot</div><div id="apiBootRecoveryLine">GET /api/boot-recovery</div><div id="apiTelegramHealthLine">GET /api/telegram/health</div><div id="apiTelegramRecoverLine">GET /api/telegram/recover?reset_offset=1</div></div></div>
@@ -2546,6 +3115,9 @@ String telegramHealthJson() {
   json += "\"last_error\":\"" + jsonEscape(getTgLastError()) + "\",";
   json += "\"task_restart_count\":" + String(telegramTaskRestartCount) + ",";
   json += "\"last_update_id\":" + String(telegramLastUpdateId) + ",";
+  json += "\"heap_recovery_pending\":" + String(telegramHeapRecoveryRequested ? "true" : "false") + ",";
+  json += "\"heap_recovery_free_heap\":" + String(telegramHeapRecoveryFreeHeap) + ",";
+  json += "\"heap_recovery_max_block\":" + String(telegramHeapRecoveryMaxBlock) + ",";
   json += "\"webhook_recovery_pending\":" + String(telegramWebhookRecoveryPending ? "true" : "false") + ",";
   json += "\"poll_ok_count\":" + String(telegramMetricPollOk) + ",";
   json += "\"poll_err_count\":" + String(telegramMetricPollKo) + ",";
@@ -2942,6 +3514,9 @@ void setup() {
   log_event(BUGLOG_INFO, 1000, "boot");
   logLine("[SYS] Boot session: " + bootSessionIdHex());
   logLine("[SYS] Reset reason: " + String((int)bootResetReason));
+  if (!TELEGRAM_RUNTIME_ENABLED) {
+    logLine("[TG] Diagnostic build: Telegram disabilitato");
+  }
   if (bootResetReason == ESP_RST_SW) {
     logLine(String("[SYS] SW reset ") + (intentionalSwReset ? "intenzionale" : "non marcato"));
   }
@@ -2997,51 +3572,59 @@ void setup() {
   if (logMutex == nullptr) {
     logMutex = xSemaphoreCreateMutex();
   }
-  if (deviceCmdQueue == nullptr) {
-    deviceCmdQueue = xQueueCreate(8, sizeof(DeviceCmd));
-  }
-  if (prefsMutex == nullptr) {
-    prefsMutex = xSemaphoreCreateMutex();
-  }
-  appendPersistentBootEvent(
-    "boot reset=" + String((int)bootResetReason) +
-    " intent=" + String(intentionalSwReset ? 1 : 0) +
-    " crash=" + String(rtcCrashCount) +
-    " soft=" + String(rtcSoftLockRebootCount)
-  );
-  setupPins();
-  loadTimings();
-  loadWifiConfig();
-  loadTelegramState();
-  if (wifiSsidConfig.length() == 0 && wm.getWiFiIsSaved()) {
-    syncWifiConfigFromSystem("preload");
-  }
-
-  // WiFi stability
-  WiFi.setSleep(false);
-  WiFi.persistent(true);
-  WiFi.setAutoReconnect(true);
-  WiFi.mode(WIFI_STA);
-
-  // WiFiManager
-  wm.setConfigPortalBlocking(true);
-  wm.setConfigPortalTimeout(180);                 // evita blocchi indefiniti in setup
-  wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_SEC); // ? 30 secondi
-  wm.setSaveConfigCallback([]() { wifiConfigNeedsSync = true; });
-  bool hasStoredWifi = havePersistentWifiConfig();
-  bool connected = connectConfiguredWifi((unsigned long)WIFI_CONNECT_TIMEOUT_SEC * 1000UL);
-  if (!connected) {
-    if (!hasStoredWifi) {
-      bool portalConnected = wm.autoConnect("ESP32S2-Setup");
-      if (!portalConnected) {
-        logLine("[WiFi] Config portal timeout/uscita, AP fallback attivato");
-        startFallbackAp();
-      }
-    } else {
-      logLine("[WiFi] Configurato ma non raggiungibile: attivo AP fallback e continuo retry STA");
-      startFallbackAp();
+  {
+    ScopedHeapProbe heapProbe("bt_cfg", 1610, heapProbeBootConfig);
+    if (deviceCmdQueue == nullptr) {
+      deviceCmdQueue = xQueueCreate(8, sizeof(DeviceCmd));
+    }
+    if (prefsMutex == nullptr) {
+      prefsMutex = xSemaphoreCreateMutex();
+    }
+    appendPersistentBootEvent(
+      "boot reset=" + String((int)bootResetReason) +
+      " intent=" + String(intentionalSwReset ? 1 : 0) +
+      " crash=" + String(rtcCrashCount) +
+      " soft=" + String(rtcSoftLockRebootCount)
+    );
+    setupPins();
+    loadTimings();
+    loadWifiConfig();
+    loadTelegramState();
+    if (wifiSsidConfig.length() == 0 && wm.getWiFiIsSaved()) {
+      syncWifiConfigFromSystem("preload");
     }
   }
+  logBootStageSnapshot("bt_cfg", 1620);
+
+  {
+    ScopedHeapProbe heapProbe("bt_wifi", 1611, heapProbeBootWifi);
+    // WiFi stability
+    WiFi.setSleep(false);
+    WiFi.persistent(true);
+    WiFi.setAutoReconnect(true);
+    WiFi.mode(WIFI_STA);
+
+    // WiFiManager
+    wm.setConfigPortalBlocking(true);
+    wm.setConfigPortalTimeout(180);                 // evita blocchi indefiniti in setup
+    wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_SEC); // ? 30 secondi
+    wm.setSaveConfigCallback([]() { wifiConfigNeedsSync = true; });
+    bool hasStoredWifi = havePersistentWifiConfig();
+    bool connected = connectConfiguredWifi((unsigned long)WIFI_CONNECT_TIMEOUT_SEC * 1000UL);
+    if (!connected) {
+      if (!hasStoredWifi) {
+        bool portalConnected = wm.autoConnect("ESP32S2-Setup");
+        if (!portalConnected) {
+          logLine("[WiFi] Config portal timeout/uscita, AP fallback attivato");
+          startFallbackAp();
+        }
+      } else {
+        logLine("[WiFi] Configurato ma non raggiungibile: attivo AP fallback e continuo retry STA");
+        startFallbackAp();
+      }
+    }
+  }
+  logBootStageSnapshot("bt_wifi", 1621);
 
   if (wifiConnected()) {
     if (wifiConfigNeedsSync || wifiSsidConfig.length() == 0) {
@@ -3050,10 +3633,15 @@ void setup() {
     }
     logLine("[WiFi] Connesso");
     logLine("[WiFi] IP: " + WiFi.localIP().toString());
-    if (ensureTimeSynced(1500)) logLine("[NTP] Ora sincronizzata");
-    else logLine("[NTP] Sync timeout");
+    {
+      ScopedHeapProbe heapProbe("bt_ntp", 1612, heapProbeBootNtp);
+      if (ensureTimeSynced(1500)) logLine("[NTP] Ora sincronizzata");
+      else logLine("[NTP] Sync timeout");
+    }
+    logBootStageSnapshot("bt_ntp", 1622);
+    scheduleNodeRedPresenceReport("boot", NODERED_REPORT_BOOT_DELAY_MS);
     if (telegramConfigured()) scheduleTelegramWebhookRecovery("startup_boot", 2000);
-    scheduleTelegramNotification("boot", 15000);  // 15s: lascia tempo all'heap di stabilizzarsi dopo WiFi+NTP+HTTP
+    if (TELEGRAM_BOOT_NOTIFY_ENABLED) scheduleTelegramNotification("boot", 15000);  // 15s: lascia tempo all'heap di stabilizzarsi dopo WiFi+NTP+HTTP
   } else {
     logLine("[WiFi] Non connesso (AP mode attivo).");
   }
@@ -3061,31 +3649,39 @@ void setup() {
   lastWiFiConnected = wifiConnected();
   wifiOfflineSinceMs = lastWiFiConnected ? 0 : millis();
 
-  setupRoutes();
-  server.begin();
-  logLine("[HTTP] Server avviato");
-
-  if (!safeModeActive && TELEGRAM_TASK_AUTOSTART && telegramTaskHandle == nullptr) {
-    startTelegramTask("boot");
-  } else if (safeModeActive) {
-    logLine("[SYS] SAFE MODE: telegramTask non avviato. Usa la web UI per OTA.");
+  {
+    ScopedHeapProbe heapProbe("bt_http", 1613, heapProbeBootHttp);
+    setupRoutes();
+    server.begin();
+    logLine("[HTTP] Server avviato");
   }
+  logBootStageSnapshot("bt_http", 1623);
 
-  if (safetyTaskHandle == nullptr) {
-    BaseType_t safeCreateOk = xTaskCreate(
-      safetyTask,
-      "safetyTask",
-      6144,  // BUG-7 FIX: 4096 era tight; restartFromWatchdog chiama logLine+buglog_flush(8)+NVS write
-      nullptr,
-      1,
-      &safetyTaskHandle
-    );
-    if (safeCreateOk != pdPASS || safetyTaskHandle == nullptr) {
-      logLine("[SYS] safetyTask create FAILED");
-      log_event(BUGLOG_ERROR, 1302, "safety_task_create_failed");
-      appendPersistentBootEvent("task_create_failed name=safetyTask");
+  {
+    ScopedHeapProbe heapProbe("bt_task", 1614, heapProbeBootTasks);
+    if (!safeModeActive && TELEGRAM_TASK_AUTOSTART && telegramTaskHandle == nullptr) {
+      startTelegramTask("boot");
+    } else if (safeModeActive) {
+      logLine("[SYS] SAFE MODE: telegramTask non avviato. Usa la web UI per OTA.");
+    }
+
+    if (safetyTaskHandle == nullptr) {
+      BaseType_t safeCreateOk = xTaskCreate(
+        safetyTask,
+        "safetyTask",
+        6144,  // BUG-7 FIX: 4096 era tight; restartFromWatchdog chiama logLine+buglog_flush(8)+NVS write
+        nullptr,
+        1,
+        &safetyTaskHandle
+      );
+      if (safeCreateOk != pdPASS || safetyTaskHandle == nullptr) {
+        logLine("[SYS] safetyTask create FAILED");
+        log_event(BUGLOG_ERROR, 1302, "safety_task_create_failed");
+        appendPersistentBootEvent("task_create_failed name=safetyTask");
+      }
     }
   }
+  logBootStageSnapshot("bt_task", 1624);
 
   markLoopHeartbeat();
   markTelegramHeartbeat();
@@ -3096,6 +3692,7 @@ void loop() {
   buglog_tick();
   maybeLogPersistentHeartbeat();
   maybeRecoverTelegramTask();
+  processNodeRedPresenceReport();
   processDeviceCmdQueue();
 
   // Dopo SAFE_MODE_CLEAR_MS di uptime stabile, azzera contatore crash
@@ -3155,8 +3752,9 @@ void loop() {
       stopFallbackAp();
       if (ensureTimeSynced(1500)) logLine("[NTP] Ora sincronizzata");
       else logLine("[NTP] Sync timeout");
+      scheduleNodeRedPresenceReport("wifi_reconnected", 500);
       if (telegramConfigured()) scheduleTelegramWebhookRecovery("wifi_reconnected", 800);
-      scheduleTelegramNotification("wifi_reconnected", 1000);
+      if (TELEGRAM_BOOT_NOTIFY_ENABLED) scheduleTelegramNotification("wifi_reconnected", 1000);
       logLine("[WiFi] Riconnesso");
     } else {
       if (wifiOfflineSinceMs == 0) wifiOfflineSinceMs = millis();
@@ -3182,6 +3780,12 @@ void loop() {
     wifiConfigNeedsSync = false;
   }
 }
+
+
+
+
+
+
 
 
 

@@ -1,0 +1,514 @@
+[
+  {
+    "id": "tab_esp32_bridge",
+    "type": "tab",
+    "label": "ESP32 Power Console",
+    "disabled": false,
+    "info": "Telegram bridge + presence receiver",
+    "env": [
+      {
+        "name": "ESP32_FALLBACK_URL",
+        "type": "str",
+        "value": "http://192.168.90.3"
+      },
+      {
+        "name": "TELEGRAM_ALLOWED_CHAT_ID",
+        "type": "str",
+        "value": ""
+      },
+      {
+        "name": "TELEGRAM_NOTIFY_CHAT_ID",
+        "type": "str",
+        "value": ""
+      }
+    ]
+  },
+  {
+    "id": "cfg_tg_bot",
+    "type": "telegram bot",
+    "botname": "ESP32 Power Console",
+    "usernames": "",
+    "chatids": "",
+    "baseapiurl": "",
+    "updatemode": "polling",
+    "pollinterval": "300",
+    "token": "${TELEGRAM_BOT_TOKEN}",
+    "usesocks": false,
+    "sockshost": "",
+    "socksprotocol": "socks5",
+    "socksport": "6667",
+    "socksusername": "anonymous",
+    "sockspassword": "",
+    "bothost": "",
+    "botpath": "",
+    "localbotport": "8443",
+    "publicbotport": "8443",
+    "privatekey": "",
+    "certificate": "",
+    "useselfsignedcertificate": false,
+    "sslterminated": false,
+    "verboselogging": false
+  },
+  {
+    "id": "http_presence",
+    "type": "http in",
+    "z": "tab_esp32_bridge",
+    "name": "ESP32 presence POST",
+    "url": "/esp32/presence",
+    "method": "post",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 140,
+    "y": 80,
+    "wires": [
+      [
+        "json_presence"
+      ]
+    ]
+  },
+  {
+    "id": "json_presence",
+    "type": "json",
+    "z": "tab_esp32_bridge",
+    "name": "Parse presence JSON",
+    "property": "payload",
+    "action": "",
+    "pretty": false,
+    "x": 360,
+    "y": 80,
+    "wires": [
+      [
+        "fn_store_presence"
+      ]
+    ]
+  },
+  {
+    "id": "fn_store_presence",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Store presence",
+    "func": "let p = msg.payload;\nif (typeof p === 'string') {\n  try { p = JSON.parse(p); } catch (e) { p = {}; }\n}\nif (!p || typeof p !== 'object') p = {};\nif (p.payload && typeof p.payload === 'object') p = p.payload;\nconst nowIso = new Date().toISOString();\nconst presence = {\n  received_at: nowIso,\n  reason: p.reason || 'unknown',\n  ip: p.ip || '',\n  host: p.host || '',\n  fw: p.fw || '',\n  fw_full: p.fw_full || '',\n  boot_id: p.boot_id || '',\n  running_partition: p.running_partition || '',\n  wifi_ssid: p.wifi_ssid || '',\n  rssi: Number.isFinite(p.rssi) ? p.rssi : (p.rssi ?? null),\n  rome_time: p.rome_time || ''\n};\nflow.set('esp32_presence', presence);\nconst fileMsg = { filename: '/data/esp32-power-console-last.json', payload: JSON.stringify(presence, null, 2) };\nconst notifyChatId = String(env.get('TELEGRAM_NOTIFY_CHAT_ID') || env.get('TELEGRAM_ALLOWED_CHAT_ID') || '').trim();\nconst shouldNotify = !!notifyChatId && (presence.reason === 'boot' || presence.reason === 'wifi_reconnected');\nlet notifyMsg = null;\nif (shouldNotify) {\n  let text = 'ESP32 Power Console';\n  text += presence.reason === 'boot' ? '\\nBoot completato.' : '\\nWiFi riconnesso.';\n  text += `\\nIP: ${presence.ip || 'sconosciuto'}`;\n  if (presence.host) text += `\\nHOST: ${presence.host}`;\n  if (presence.fw) text += `\\nFW: ${presence.fw}`;\n  if (presence.boot_id) text += `\\nBOOT: ${presence.boot_id}`;\n  if (presence.running_partition) text += `\\nSlot: ${presence.running_partition}`;\n  if (presence.wifi_ssid) text += `\\nWiFi: ${presence.wifi_ssid}`;\n  if (presence.rssi !== null && presence.rssi !== undefined) text += `\\nRSSI: ${presence.rssi} dBm`;\n  if (presence.rome_time) text += `\\nOra board: ${presence.rome_time}`;\n  notifyMsg = { payload: { chatId: notifyChatId, type: 'message', content: text } };\n}\nmsg.payload = { ok: true, stored: true, ip: presence.ip, boot_id: presence.boot_id, reason: presence.reason, notify: shouldNotify };\nreturn [msg, fileMsg, notifyMsg];",
+    "outputs": 3,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 590,
+    "y": 80,
+    "wires": [
+      [
+        "http_presence_res"
+      ],
+      [
+        "file_presence"
+      ],
+      [
+        "tg_tx"
+      ]
+    ]
+  },
+  {
+    "id": "http_presence_res",
+    "type": "http response",
+    "z": "tab_esp32_bridge",
+    "name": "Presence 200",
+    "statusCode": "",
+    "headers": {},
+    "x": 820,
+    "y": 60,
+    "wires": []
+  },
+  {
+    "id": "file_presence",
+    "type": "file",
+    "z": "tab_esp32_bridge",
+    "name": "Write last presence",
+    "filename": "",
+    "filenameType": "msg",
+    "appendNewline": false,
+    "createDir": true,
+    "overwriteFile": "true",
+    "encoding": "utf8",
+    "x": 830,
+    "y": 100,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "inj_keepalive",
+    "type": "inject",
+    "z": "tab_esp32_bridge",
+    "name": "Keepalive every 10 min",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "600",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "20",
+    "topic": "",
+    "payload": "",
+    "payloadType": "date",
+    "x": 150,
+    "y": 180,
+    "wires": [
+      [
+        "fn_resolve_status"
+      ]
+    ]
+  },
+  {
+    "id": "fn_resolve_status",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Resolve status URL",
+    "func": "const presence = flow.get('esp32_presence') || {};\nconst fallback = String(env.get('ESP32_FALLBACK_URL') || '').trim();\nlet base = '';\nif (presence.ip) base = `http://${presence.ip}`;\nelse if (fallback) base = fallback;\nif (!base) return null;\nmsg.method = 'GET';\nmsg.url = `${base}/api/status`;\nmsg.headers = { Accept: 'application/json' };\nmsg.timeout = 5000;\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 390,
+    "y": 180,
+    "wires": [
+      [
+        "http_status_poll"
+      ]
+    ]
+  },
+  {
+    "id": "http_status_poll",
+    "type": "http request",
+    "z": "tab_esp32_bridge",
+    "name": "GET /api/status",
+    "method": "use",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 620,
+    "y": 180,
+    "wires": [
+      [
+        "fn_store_status"
+      ]
+    ]
+  },
+  {
+    "id": "fn_store_status",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Store status cache",
+    "func": "const p = msg.payload || {};\nconst status = {\n  fetched_at: new Date().toISOString(),\n  reachable: true,\n  ip: p.ip || '',\n  fw_version: p.fw_version || '',\n  fw_full: p.fw_full || '',\n  boot_id: p.boot_id || '',\n  running_partition: p.running_partition || '',\n  wifi_connected: !!p.wifi_connected,\n  wifi_ssid: p.wifi_ssid || '',\n  rssi: p.rssi ?? null,\n  mode: p.mode || '',\n  uptime_s: p.uptime_s ?? 0,\n  rome_time: p.rome_time || '',\n  raw: p\n};\nflow.set('esp32_status', status);\nmsg.filename = '/data/esp32-power-console-status.json';\nmsg.payload = JSON.stringify(status, null, 2);\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 860,
+    "y": 180,
+    "wires": [
+      [
+        "file_status"
+      ]
+    ]
+  },
+  {
+    "id": "file_status",
+    "type": "file",
+    "z": "tab_esp32_bridge",
+    "name": "Write status cache",
+    "filename": "",
+    "filenameType": "msg",
+    "appendNewline": false,
+    "createDir": true,
+    "overwriteFile": "true",
+    "encoding": "utf8",
+    "x": 1090,
+    "y": 180,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "tg_rx",
+    "type": "telegram receiver",
+    "z": "tab_esp32_bridge",
+    "name": "Telegram RX",
+    "bot": "cfg_tg_bot",
+    "saveDataDir": "",
+    "filterCommands": false,
+    "x": 130,
+    "y": 320,
+    "wires": [
+      [
+        "fn_route_tg"
+      ],
+      [],
+      []
+    ]
+  },
+  {
+    "id": "fn_route_tg",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Route Telegram command",
+    "func": "const allowed = String(env.get('TELEGRAM_ALLOWED_CHAT_ID') || '').trim();\nconst chatId = String(msg.originalMessage?.chat?.id ?? '');\nif (!chatId) return null;\nif (allowed && chatId !== allowed) {\n  return [null, null, null, null, { payload: { chatId, type: 'message', content: 'Chat non autorizzata.' } }];\n}\nconst text = String(msg.payload?.content || '').trim();\nconst cmd = text.split(/\\s+/)[0].toLowerCase();\nmsg.chatId = chatId;\nif (cmd === '/ip') return [msg, null, null, null, null];\nif (cmd === '/status') return [null, msg, null, null, null];\nif (cmd === '/pulse' || cmd === '/accendi') return [null, null, msg, null, null];\nif (cmd === '/force' || cmd === '/forceshutdown') return [null, null, null, msg, null];\nreturn [null, null, null, null, { payload: { chatId, type: 'message', content: 'Comandi disponibili:\\n/ip\\n/status\\n/pulse\\n/force\\n/help' } }];",
+    "outputs": 5,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 370,
+    "y": 320,
+    "wires": [
+      [
+        "fn_reply_ip"
+      ],
+      [
+        "fn_reply_status"
+      ],
+      [
+        "fn_prepare_pulse"
+      ],
+      [
+        "fn_prepare_force"
+      ],
+      [
+        "tg_tx"
+      ]
+    ]
+  },
+  {
+    "id": "fn_reply_ip",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Reply /ip",
+    "func": "const p = flow.get('esp32_presence') || {};\nconst s = flow.get('esp32_status') || {};\nconst fallback = String(env.get('ESP32_FALLBACK_URL') || '').trim();\nconst fallbackIp = fallback.replace(/^https?:\\/\\//, '').replace(/\\/$/, '');\nconst ip = p.ip || s.ip || fallbackIp || 'sconosciuto';\nlet text = 'ESP32 Power Console';\ntext += `\\nIP: ${ip}`;\nif (p.host) text += `\\nHOST: ${p.host}`;\nif (p.reason) text += `\\nEvento: ${p.reason}`;\nif (p.received_at) text += `\\nUltimo report: ${p.received_at}`;\nif (s.fetched_at) text += `\\nUltimo keepalive: ${s.fetched_at}`;\nif (s.uptime_s !== undefined) text += `\\nUptime cache: ${s.uptime_s}s`;\nmsg.payload = { chatId: msg.chatId, type: 'message', content: text };\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 620,
+    "y": 280,
+    "wires": [
+      [
+        "tg_tx"
+      ]
+    ]
+  },
+  {
+    "id": "fn_reply_status",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Reply /status",
+    "func": "const s = flow.get('esp32_status') || {};\nconst p = flow.get('esp32_presence') || {};\nlet text = 'ESP32 status (cache)';\nif (s.fetched_at) text += `\\nAggiornato: ${s.fetched_at}`;\nelse text += '\\nAggiornato: nessun keepalive ancora disponibile';\ntext += `\\nIP: ${s.ip || p.ip || 'sconosciuto'}`;\nif (s.fw_version) text += `\\nFW: ${s.fw_version}`;\nif (s.boot_id) text += `\\nBOOT: ${s.boot_id}`;\nif (s.mode) text += `\\nMODE: ${s.mode}`;\nif (s.wifi_connected !== undefined) text += `\\nWiFi: ${s.wifi_connected ? 'connesso' : 'non connesso'}`;\nif (s.rssi !== undefined && s.rssi !== null) text += `\\nRSSI: ${s.rssi} dBm`;\nif (s.uptime_s !== undefined) text += `\\nUptime: ${s.uptime_s}s`;\nmsg.payload = { chatId: msg.chatId, type: 'message', content: text };\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 620,
+    "y": 320,
+    "wires": [
+      [
+        "tg_tx"
+      ]
+    ]
+  },
+  {
+    "id": "fn_prepare_pulse",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Prepare /pulse",
+    "func": "const presence = flow.get('esp32_presence') || {};\nconst fallback = String(env.get('ESP32_FALLBACK_URL') || '').trim();\nlet base = '';\nif (presence.ip) base = `http://${presence.ip}`;\nelse if (fallback) base = fallback;\nif (!base) {\n  msg.payload = { chatId: msg.chatId, type: 'message', content: 'Nessun IP disponibile per la board.' };\n  return [null, msg];\n}\nmsg.method = 'GET';\nmsg.url = `${base}/api/pc/pulse`;\nmsg.headers = { Accept: 'application/json' };\nmsg.timeout = 5000;\nreturn [msg, null];",
+    "outputs": 2,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 620,
+    "y": 380,
+    "wires": [
+      [
+        "http_pulse"
+      ],
+      [
+        "tg_tx"
+      ]
+    ]
+  },
+  {
+    "id": "http_pulse",
+    "type": "http request",
+    "z": "tab_esp32_bridge",
+    "name": "GET pulse",
+    "method": "use",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 860,
+    "y": 380,
+    "wires": [
+      [
+        "fn_pulse_reply"
+      ]
+    ]
+  },
+  {
+    "id": "fn_pulse_reply",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Reply pulse",
+    "func": "const p = msg.payload || {};\nconst text = p.ok ? `Pulse inviato (${p.pulse_ms || '?'} ms)` : `Pulse KO: ${p.error || 'errore sconosciuto'}`;\nmsg.payload = { chatId: msg.chatId, type: 'message', content: text };\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1080,
+    "y": 380,
+    "wires": [
+      [
+        "tg_tx"
+      ]
+    ]
+  },
+  {
+    "id": "fn_prepare_force",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Prepare /force",
+    "func": "const presence = flow.get('esp32_presence') || {};\nconst fallback = String(env.get('ESP32_FALLBACK_URL') || '').trim();\nlet base = '';\nif (presence.ip) base = `http://${presence.ip}`;\nelse if (fallback) base = fallback;\nif (!base) {\n  msg.payload = { chatId: msg.chatId, type: 'message', content: 'Nessun IP disponibile per la board.' };\n  return [null, msg];\n}\nmsg.method = 'GET';\nmsg.url = `${base}/api/pc/forceshutdown`;\nmsg.headers = { Accept: 'application/json' };\nmsg.timeout = 5000;\nreturn [msg, null];",
+    "outputs": 2,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 620,
+    "y": 440,
+    "wires": [
+      [
+        "http_force"
+      ],
+      [
+        "tg_tx"
+      ]
+    ]
+  },
+  {
+    "id": "http_force",
+    "type": "http request",
+    "z": "tab_esp32_bridge",
+    "name": "GET force",
+    "method": "use",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 860,
+    "y": 440,
+    "wires": [
+      [
+        "fn_force_reply"
+      ]
+    ]
+  },
+  {
+    "id": "fn_force_reply",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Reply force",
+    "func": "const p = msg.payload || {};\nconst text = p.ok ? `Force shutdown inviato (${p.pulse_ms || '?'} ms)` : `Force shutdown KO: ${p.error || 'errore sconosciuto'}`;\nmsg.payload = { chatId: msg.chatId, type: 'message', content: text };\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1080,
+    "y": 440,
+    "wires": [
+      [
+        "tg_tx"
+      ]
+    ]
+  },
+  {
+    "id": "catch_cmd_http",
+    "type": "catch",
+    "z": "tab_esp32_bridge",
+    "name": "Catch pulse/force errors",
+    "scope": [
+      "http_pulse",
+      "http_force"
+    ],
+    "uncaught": false,
+    "x": 620,
+    "y": 520,
+    "wires": [
+      [
+        "fn_http_cmd_error"
+      ]
+    ]
+  },
+  {
+    "id": "fn_http_cmd_error",
+    "type": "function",
+    "z": "tab_esp32_bridge",
+    "name": "Reply HTTP error",
+    "func": "if (!msg.chatId) return null;\nconst err = msg.error?.message || 'request failed';\nmsg.payload = { chatId: msg.chatId, type: 'message', content: `Richiesta KO: ${err}` };\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 860,
+    "y": 520,
+    "wires": [
+      [
+        "tg_tx"
+      ]
+    ]
+  },
+  {
+    "id": "tg_tx",
+    "type": "telegram sender",
+    "z": "tab_esp32_bridge",
+    "name": "Telegram TX",
+    "bot": "cfg_tg_bot",
+    "haserroroutput": false,
+    "outputs": 1,
+    "x": 1310,
+    "y": 360,
+    "wires": [
+      []
+    ]
+  }
+]
