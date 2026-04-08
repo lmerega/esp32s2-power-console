@@ -2,7 +2,7 @@
 
 ## 2026-04-08
 
-- Bump firmware principale a `1.5.18`
+- Bump firmware principale a `1.6.0`
 - Confermata stabilita' overnight della variante senza Telegram on-board
 - Telegram rimosso dal runtime dell'ESP32-S2 come canale operativo principale
 - Aggiunto report HTTP leggero verso Node-RED al `boot` e alla riconnessione WiFi

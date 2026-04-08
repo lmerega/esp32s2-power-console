@@ -20,7 +20,7 @@ WebServer server(80);
 WiFiManager wm;
 Preferences prefs;
 
-#define FW_VERSION "1.5.18"
+#define FW_VERSION "1.6.0"
 
 // =====================
 // PIN (S2 mini)

@@ -4,7 +4,7 @@ Firmware per `LOLIN S2 Mini` usato come controllo remoto del tasto power del PC 
 
 Versione firmware principale corrente:
 
-- `1.5.18`
+- `1.6.0`
 
 Ultima build verificata localmente:
 
