@@ -251,10 +251,16 @@ const uint8_t FACTORY_BOOT_CRASH_THRESHOLD = 6;  // dopo 6 crash salta alla fact
 const unsigned long SAFE_MODE_CLEAR_MS = 60000;  // dopo 60s stabili ??? reset contatore
 const uint8_t SOFTLOCK_FACTORY_BOOT_THRESHOLD = 3;
 const unsigned long SOFTLOCK_CLEAR_MS = 120000;
+const uint8_t PERSISTENT_FACTORY_BOOT_THRESHOLD = 3;
+const unsigned long PERSISTENT_BOOT_CLEAR_MS = 600000;
 const uint8_t BOOT_HISTORY_CAPACITY = 12;
 bool safeModeActive = false;
 unsigned long safeModeClearAtMs = 0;
 unsigned long softLockClearAtMs = 0;
+unsigned long persistentBootClearAtMs = 0;
+uint32_t persistentBootAttemptCount = 0;
+bool bootPresenceReportedOk = false;
+bool httpServerStarted = false;
 const int WEB_LOG_CAPACITY = 100;
 String webLogBuffer[WEB_LOG_CAPACITY];
 int webLogHead = 0;
@@ -369,6 +375,12 @@ bool bootToFactory() {
   return (err == ESP_OK);
 }
 
+bool runningOnFactoryPartition() {
+  const esp_partition_t *part = esp_ota_get_running_partition();
+  if (part == nullptr) return false;
+  return part->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY;
+}
+
 void markIntentionalReboot() {
   rtcIntentionalReboot = 1;
 }
@@ -385,6 +397,7 @@ void restartFromWatchdog(const String &reason) {
   if (rtcSoftLockRebootCount >= SOFTLOCK_FACTORY_BOOT_THRESHOLD) {
     logLine("[SAFE] Soglia soft-lock raggiunta, provo boot in recovery factory");
     if (bootToFactory()) {
+      clearPersistentBootAttemptCount("softlock_factory_boot");
       rtcSoftLockRebootCount = 0;
       rtcCrashCount = 0;
       delay(200);
@@ -403,6 +416,7 @@ bool bootToFactoryNow(const String &reason) {
   log_event(BUGLOG_ERROR, 1102, reason);
   buglog_flush(8);
   appendPersistentBootEvent("boot_factory reason=" + reason + " reset=" + String((int)bootResetReason));
+  clearPersistentBootAttemptCount("factory_boot");
   if (!bootToFactory()) {
     logLine("[SAFE] Auto recovery fallita: factory partition non trovata");
     return false;
@@ -2342,6 +2356,50 @@ static void unlockPrefs() {
   if (prefsMutex != nullptr) xSemaphoreGive(prefsMutex);
 }
 
+uint32_t getPersistentBootAttemptCount() {
+  if (!lockPrefs()) return persistentBootAttemptCount;
+  prefs.begin("pcpower", true);
+  uint32_t count = prefs.getUInt("boot_try", persistentBootAttemptCount);
+  prefs.end();
+  unlockPrefs();
+  persistentBootAttemptCount = count;
+  return count;
+}
+
+uint32_t incrementPersistentBootAttemptCount() {
+  if (!lockPrefs()) return persistentBootAttemptCount;
+  prefs.begin("pcpower", false);
+  uint32_t count = prefs.getUInt("boot_try", 0);
+  if (count < 255U) count++;
+  prefs.putUInt("boot_try", count);
+  prefs.end();
+  unlockPrefs();
+  persistentBootAttemptCount = count;
+  return count;
+}
+
+void clearPersistentBootAttemptCount(const char *reason) {
+  uint32_t previousCount = persistentBootAttemptCount;
+  bool cleared = false;
+
+  if (lockPrefs()) {
+    prefs.begin("pcpower", false);
+    previousCount = prefs.getUInt("boot_try", previousCount);
+    prefs.putUInt("boot_try", 0);
+    prefs.end();
+    unlockPrefs();
+    cleared = true;
+  }
+
+  persistentBootAttemptCount = 0;
+  persistentBootClearAtMs = 0;
+  if (!cleared || previousCount == 0) return;
+
+  String why = (reason != nullptr && reason[0] != '\0') ? String(reason) : String("healthy_boot");
+  logLine("[SAFE] Boot attempts persistenti azzerati (erano " + String(previousCount) + ", " + why + ")");
+  appendPersistentBootEvent("boot_try_clear was=" + String(previousCount) + " reason=" + why);
+}
+
 void appendPersistentBootEvent(const String &eventLine) {
   if (!lockPrefs()) return;
   prefs.begin("pcpower", false);
@@ -2509,6 +2567,7 @@ bool sendNodeRedPresenceReport(const String &reason) {
   if (code > 0 && code < 300) {
     logLine("[NR] Presence report OK (" + reason + ")");
     appendPersistentBootEvent("presence " + reason + " ip=" + WiFi.localIP().toString());
+    bootPresenceReportedOk = true;
     return true;
   }
 
@@ -2763,6 +2822,13 @@ String statusJson() {
   json += "\"safe_mode\":" + String(safeModeActive ? "true" : "false") + ",";
   json += "\"crash_count\":" + String(rtcCrashCount) + ",";
   json += "\"softlock_reboot_count\":" + String(rtcSoftLockRebootCount) + ",";
+  json += "\"persistent_boot_attempt_count\":" + String(persistentBootAttemptCount) + ",";
+  json += "\"persistent_boot_threshold\":" + String(PERSISTENT_FACTORY_BOOT_THRESHOLD) + ",";
+  json += "\"persistent_boot_clear_in_ms\":" + String(
+    (persistentBootAttemptCount > 0 && persistentBootClearAtMs != 0 && (long)(persistentBootClearAtMs - now) > 0)
+      ? (persistentBootClearAtMs - now)
+      : 0
+  ) + ",";
   json += "\"wifi_offline_s\":" + String(wifiOfflineMs / 1000UL) + ",";
   json += "\"rssi\":" + String(rssi) + ",";
   json += "\"signal_pct\":" + String(rssiToPercent(rssi)) + ",";
@@ -3270,6 +3336,7 @@ void handleApiBootRecovery() {
     sendJson(500, "{\"ok\":false,\"error\":\"factory_partition_not_found\"}");
     return;
   }
+  clearPersistentBootAttemptCount("manual_recovery");
   rtcCrashCount = 0;
   rtcSoftLockRebootCount = 0;
   markIntentionalReboot();
@@ -3505,15 +3572,35 @@ void setup() {
   buglog_begin();
   clearWebLogs();
   resetOtaUploadProgress();
+  bootPresenceReportedOk = false;
+  httpServerStarted = false;
+  persistentBootClearAtMs = 0;
   bootSessionId = esp_random();
   if (bootSessionId == 0) bootSessionId = 1;
   bootResetReason = esp_reset_reason();
+  if (prefsMutex == nullptr) {
+    prefsMutex = xSemaphoreCreateMutex();
+  }
   bool intentionalSwReset = (rtcIntentionalReboot != 0);
   rtcIntentionalReboot = 0;
   logLine("[SYS] Boot");
   log_event(BUGLOG_INFO, 1000, "boot");
   logLine("[SYS] Boot session: " + bootSessionIdHex());
   logLine("[SYS] Reset reason: " + String((int)bootResetReason));
+  if (!runningOnFactoryPartition()) {
+    persistentBootAttemptCount = incrementPersistentBootAttemptCount();
+    logLine("[SAFE] boot_try persistente=" + String(persistentBootAttemptCount));
+    appendPersistentBootEvent(
+      "boot_try count=" + String(persistentBootAttemptCount) +
+      " reset=" + String((int)bootResetReason) +
+      " slot=" + runningPartitionLabel()
+    );
+    if (persistentBootAttemptCount >= PERSISTENT_FACTORY_BOOT_THRESHOLD) {
+      bootToFactoryNow("persistent_boot_failures count=" + String(persistentBootAttemptCount));
+    }
+  } else {
+    persistentBootAttemptCount = getPersistentBootAttemptCount();
+  }
   if (!TELEGRAM_RUNTIME_ENABLED) {
     logLine("[TG] Diagnostic build: Telegram disabilitato");
   }
@@ -3538,6 +3625,7 @@ void setup() {
     logLine("[SYS] Troppi crash (" + String(rtcCrashCount) + "), salto alla factory partition...");
     rtcCrashCount = 0;
     if (bootToFactory()) {
+      clearPersistentBootAttemptCount("crash_factory_boot");
       rtcSoftLockRebootCount = 0;
       markIntentionalReboot();
       delay(200);
@@ -3551,6 +3639,7 @@ void setup() {
     if (rtcSoftLockRebootCount >= SOFTLOCK_FACTORY_BOOT_THRESHOLD) {
       logLine("[SYS] Troppi reboot soft-lock (" + String(rtcSoftLockRebootCount) + "), salto alla factory partition...");
       if (bootToFactory()) {
+        clearPersistentBootAttemptCount("softlock_factory_boot");
         rtcSoftLockRebootCount = 0;
         rtcCrashCount = 0;
         markIntentionalReboot();
@@ -3653,6 +3742,7 @@ void setup() {
     ScopedHeapProbe heapProbe("bt_http", 1613, heapProbeBootHttp);
     setupRoutes();
     server.begin();
+    httpServerStarted = true;
     logLine("[HTTP] Server avviato");
   }
   logBootStageSnapshot("bt_http", 1623);
@@ -3716,6 +3806,20 @@ void loop() {
     if (rtcSoftLockRebootCount > 0 && wifiConnected() && !otaUploadInProgress) {
       logLine("[SYS] Uptime stabile, soft-lock reboot counter azzerato (era " + String(rtcSoftLockRebootCount) + ")");
       rtcSoftLockRebootCount = 0;
+    }
+  }
+
+  if (persistentBootAttemptCount > 0) {
+    bool bootReady = httpServerStarted && (wifiConnected() || fallbackApActive);
+    if (!bootReady) {
+      persistentBootClearAtMs = 0;
+    } else {
+      if (persistentBootClearAtMs == 0) {
+        persistentBootClearAtMs = bootMillisBaseline + PERSISTENT_BOOT_CLEAR_MS;
+      }
+      if ((long)(millis() - persistentBootClearAtMs) >= 0) {
+        clearPersistentBootAttemptCount("healthy_uptime");
+      }
     }
   }
 

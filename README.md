@@ -32,6 +32,8 @@ Ultima build verificata localmente:
 - Heartbeat diagnostico persistente per `heap`, WiFi e stato task
 - Scan WiFi asincrono dalla dashboard
 - Nessun passaggio automatico in recovery factory per sola perdita WiFi
+- Fallback automatico in `factory` dopo `3` boot falliti persistiti in `NVS`
+- Azzeramento del contatore boot solo dopo `10` minuti di uptime sano
 - Favicon SVG inline con icona power su dashboard e pagina OTA
 
 ## Board e build

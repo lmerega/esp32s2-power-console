@@ -152,3 +152,10 @@
 - Board target: `esp32:esp32:lolin_s2_mini`
 - Firmware con UI locale, Telegram, Web OTA e fallback AP
 - Progetto pensato per LAN domestica e controllo power switch PC tramite optoisolatore
+# 2026-04-08
+
+- Added a persistent NVS-backed boot attempt counter for the main firmware.
+- Main firmware now falls back to the `factory` recovery partition after 3 failed boots, even across manual power cycles.
+- Persistent boot attempts are cleared only after 10 minutes of healthy uptime.
+- Exposed `persistent_boot_attempt_count`, threshold, and remaining clear window in `/api/status`.
+- Fixed Node-RED file nodes in the `ESP32 Power Console` flow so `Write last presence` and `Write status cache` correctly use `msg.filename`.
