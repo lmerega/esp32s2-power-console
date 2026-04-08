@@ -315,6 +315,7 @@ Buglog persistente:
 - `GET /api/buglog/clear` azzera il buffer persistente
 - `code=1500` heartbeat normale ogni `15` minuti
 - `code=1501` heartbeat anomalo ogni `2` minuti se rileva condizioni sospette
+- il refresh di `GET /api/status` non genera piu warning `1603` nel buglog persistente
 - `fh` = free heap, `mb` = max alloc block, `wf` = WiFi `0/1`, `la` = eta heartbeat loop, `ta` = eta heartbeat Telegram
 
 Esempio body per la configurazione WiFi:

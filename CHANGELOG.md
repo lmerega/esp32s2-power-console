@@ -17,6 +17,7 @@
 - `/ip` ora usa anche lo status cache come fallback se il report presence non e' ancora disponibile
 - Il report presence verso Node-RED ora usa backoff progressivo fino a `120` secondi quando il bridge e' irraggiungibile
 - Rimossi dalla Web UI e dalla documentazione gli endpoint Telegram on-board non piu usati nel runtime corrente
+- Il refresh di `/api/status` non scrive piu warning `1603` nel buglog persistente
 - Aggiunto fallback persistente in `NVS` verso la partizione `factory` dopo `3` boot falliti, anche con power cycle manuali
 - Il contatore dei boot persistenti si azzera solo dopo `10` minuti di uptime sano verificato
 - Verificato su device reale il ciclo completo `main -> recovery factory -> upload OTA del main -> ritorno al main`
