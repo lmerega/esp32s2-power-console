@@ -15,6 +15,11 @@
   - notifica Telegram automatica su `boot` e `wifi_reconnected`
 - Corretto il parsing del `POST /esp32/presence` nel flow Node-RED
 - `/ip` ora usa anche lo status cache come fallback se il report presence non e' ancora disponibile
+- Il report presence verso Node-RED ora usa backoff progressivo fino a `120` secondi quando il bridge e' irraggiungibile
+- Rimossi dalla Web UI e dalla documentazione gli endpoint Telegram on-board non piu usati nel runtime corrente
+- Aggiunto fallback persistente in `NVS` verso la partizione `factory` dopo `3` boot falliti, anche con power cycle manuali
+- Il contatore dei boot persistenti si azzera solo dopo `10` minuti di uptime sano verificato
+- Verificato su device reale il ciclo completo `main -> recovery factory -> upload OTA del main -> ritorno al main`
 - README aggiornato per riflettere la nuova architettura `ESP32 + Node-RED bridge`
 
 ## 2026-04-07

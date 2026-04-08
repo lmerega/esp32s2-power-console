@@ -303,19 +303,11 @@ Non usare via OTA:
 - `POST /api/config/wifi`
 - `GET /api/reboot`
 - `GET /api/boot-recovery`
-- `GET /api/telegram/health`
-- `GET /api/telegram/recover`
 - `POST /api/update`
 
 Nota:
 
 - `GET /api/config/wifi` ora risponde con `405 use_post`
-
-Health Telegram:
-
-- `GET /api/telegram/health` espone stato polling/send, backoff/failsafe, ultimi errori HTTP, contatori update/comandi, `task_running`, `task_restart_count`, `last_update_id` e heartbeat task
-- `GET /api/telegram/recover` forza il riavvio del sottosistema Telegram
-- `GET /api/telegram/recover?reset_offset=1` forza recovery Telegram e azzera l'offset persistito di `getUpdates`
 
 Buglog persistente:
 
@@ -338,6 +330,7 @@ Il bridge fa questo:
 - riceve dal firmware il report presence via `POST /esp32/presence`
 - salva l'ultimo IP noto della board
 - interroga la board con `GET /api/status` ogni `10` minuti
+- se Node-RED e' giu, il firmware ritenta il report presence con backoff progressivo fino a `120` secondi
 - risponde ai comandi Telegram `/ip`, `/status`, `/pulse`, `/force`
 - invia una notifica Telegram automatica su `boot` e `wifi_reconnected`
 

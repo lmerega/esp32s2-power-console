@@ -143,7 +143,8 @@ const unsigned long BUGLOG_HEARTBEAT_ALERT_MS = 2UL * 60UL * 1000UL;
 const unsigned long BUGLOG_HEARTBEAT_STALE_TASK_MS = 10000UL;
 const uint32_t BUGLOG_HEARTBEAT_LOW_FREE_HEAP_BYTES = 50000UL;
 const unsigned long WIFI_OFFLINE_TO_AP_MS = 5000;
-const unsigned long NODERED_REPORT_RETRY_MS = 15000UL;
+const unsigned long NODERED_REPORT_RETRY_BASE_MS = 15000UL;
+const unsigned long NODERED_REPORT_RETRY_MAX_MS = 120000UL;
 const unsigned long NODERED_REPORT_BOOT_DELAY_MS = 1500UL;
 const uint32_t NODERED_REPORT_TIMEOUT_MS = 2500UL;
 const char *FALLBACK_AP_SSID = "ESP32S2-Setup";
@@ -307,6 +308,7 @@ char telegramNotifyReasonBuf[24] = "boot";
 bool nodeRedReportPending = false;
 unsigned long nodeRedReportDueMs = 0;
 char nodeRedReportReasonBuf[24] = "";
+uint8_t nodeRedReportRetryCount = 0;
 portMUX_TYPE telegramStateMux = portMUX_INITIALIZER_UNLOCKED;
 
 // =====================
@@ -627,6 +629,14 @@ void setNodeRedReportState(const String &reason, unsigned long dueMs) {
   portEXIT_CRITICAL(&telegramStateMux);
 }
 
+unsigned long nextNodeRedReportRetryDelayMs() {
+  uint8_t attempt = nodeRedReportRetryCount;
+  if (attempt > 3U) attempt = 3U;
+  unsigned long delayMs = NODERED_REPORT_RETRY_BASE_MS << attempt;
+  if (delayMs > NODERED_REPORT_RETRY_MAX_MS) delayMs = NODERED_REPORT_RETRY_MAX_MS;
+  return delayMs;
+}
+
 void clearTelegramNotifyPending() {
   portENTER_CRITICAL(&telegramStateMux);
   telegramNotifyPending = false;
@@ -638,6 +648,7 @@ void clearNodeRedReportState() {
   nodeRedReportPending = false;
   nodeRedReportReasonBuf[0] = '\0';
   nodeRedReportDueMs = 0;
+  nodeRedReportRetryCount = 0;
   portEXIT_CRITICAL(&telegramStateMux);
 }
 
@@ -2525,6 +2536,7 @@ bool connectConfiguredWifi(unsigned long timeoutMs) {
 
 void scheduleNodeRedPresenceReport(const String &reason, unsigned long delayMs = 0) {
   if (!nodeRedReportConfigured()) return;
+  nodeRedReportRetryCount = 0;
   setNodeRedReportState(reason, millis() + delayMs);
 }
 
@@ -2593,7 +2605,10 @@ void processNodeRedPresenceReport() {
   if (sendNodeRedPresenceReport(reason)) {
     clearNodeRedReportState();
   } else {
-    setNodeRedReportState(reason, millis() + NODERED_REPORT_RETRY_MS);
+    if (nodeRedReportRetryCount < 255U) nodeRedReportRetryCount++;
+    unsigned long retryDelayMs = nextNodeRedReportRetryDelayMs();
+    logLine("[NR] Presence retry tra " + String(retryDelayMs / 1000UL) + " s");
+    setNodeRedReportState(reason, millis() + retryDelayMs);
   }
 }
 
@@ -2982,7 +2997,7 @@ R"HTML(
         <div class="panel"><h3>Buglog Persistente</h3><div class="config-row"><button class="b-save" onclick="refreshBuglog()">Aggiorna</button><button class="b-save" onclick="copyBuglogToClipboard()">Copy</button><button class="b-reset" onclick="clearBuglog()">Pulisci</button></div><div class="api-note">Salvato in flash locale. Resta disponibile anche dopo reset e power cycle.</div><div class="buglog-layout"><div class="result" id="buglogBox" style="white-space:pre-wrap;max-height:220px;overflow:auto">Nessun buglog.</div><div class="legend"><div><b>Severity</b>: <code>INFO</code> = normale, <code>WARN</code> = anomalia, <code>ERROR</code> = errore, <code>FATAL</code> = reboot watchdog.</div><div style="margin-top:8px"><b>Code</b>: <code>1000</code> boot, <code>1001</code> crash reset, <code>1101</code> watchdog reboot, <code>1102</code> recovery/factory, <code>1201</code> reset WiFi, <code>1301</code>/<code>1302</code> task create fail, <code>1310</code> task recovery, <code>1311</code> task recovery con reset offset, <code>1312</code> failsafe Telegram, <code>1313</code> heap_guard richiesto, <code>1500</code> heartbeat ok, <code>1501</code> heartbeat anomalo, <code>1600</code> tg_poll, <code>1601</code> tg_send, <code>1602</code> tg_recovery, <code>1603</code> status_json, <code>1604</code> web_logs, <code>1605</code> wifi_scan, <code>1606</code> tg_status_msg, <code>1610</code>/<code>1611</code>/<code>1612</code>/<code>1613</code>/<code>1614</code> boot_probe, <code>1620</code> boot_cfg snapshot, <code>1621</code> boot_wifi snapshot, <code>1622</code> boot_ntp snapshot, <code>1623</code> boot_http snapshot, <code>1624</code> boot_tasks snapshot, <code>1625</code> tg_recovery snapshot, <code>1626</code> tg_send snapshot, <code>1627</code> tg_poll snapshot.</div><div style="margin-top:8px"><b>Heartbeat</b>: ogni 15 minuti se tutto e normale, ogni 2 minuti se rileva una condizione sospetta.</div><div style="margin-top:8px"><b>Campi heartbeat</b>: <code>fh</code> = free heap disponibile, <code>mb</code> = blocco heap contiguo massimo allocabile, <code>wf</code> = WiFi connesso (<code>1</code>) o non connesso (<code>0</code>), <code>la</code> = eta ultimo heartbeat del loop principale in ms, <code>ta</code> = eta ultimo heartbeat del task Telegram in ms.</div><div style="margin-top:8px"><b>Campi probe heap</b>: formato <code>tag beforeFree/beforeMax&gt;afterFree/afterMax</code>. Esempio <code>tg_poll 68024/57332&gt;15980/7668</code> = il polling Telegram e uscito con heap molto piu basso di come era entrato.</div><div style="margin-top:8px"><b>Campi snapshot</b>: formato <code>tag n=... fh=... mb=...</code>. Servono a mostrare lo stato heap subito dopo recovery/send/poll e a fine fase boot.</div><div style="margin-top:8px"><b>Heap guard</b>: se <code>fh</code> scende sotto 22 KB o <code>mb</code> sotto 16 KB, il task Telegram si mette in pausa breve e il <code>loop()</code> prova un recovery controllato.</div></div></div></div>
       </div>
     </div>
-<div class="api-box"><h3>API</h3><div class="api-list"><div id="apiStatusLine">GET /api/status</div><div id="apiPulseLine">GET /api/pc/pulse</div><div id="apiForceLine">GET /api/pc/forceshutdown</div><div id="apiTestOnLine">GET /api/pc/test/on</div><div id="apiTestOffLine">GET /api/pc/test/off</div><div id="apiTimingsLine">GET /api/config/timings?pulse_ms=500&amp;force_ms=3000</div><div id="apiWifiScanLine">GET /api/wifi/scan</div><div id="apiWifiLine">POST /api/config/wifi (body: ssid=SSID&amp;password=PASSWORD)</div><div id="apiLogsLine">GET /api/logs?limit=30</div><div id="apiLogsClearLine">GET /api/logs/clear</div><div id="apiBuglogLine">GET /api/buglog</div><div id="apiBuglogClearLine">GET /api/buglog/clear</div><div id="apiBootHistoryLine">GET /api/boot-history?limit=12</div><div id="apiRebootLine">GET /api/reboot</div><div id="apiBootRecoveryLine">GET /api/boot-recovery</div><div id="apiTelegramHealthLine">GET /api/telegram/health</div><div id="apiTelegramRecoverLine">GET /api/telegram/recover?reset_offset=1</div></div></div>
+<div class="api-box"><h3>API</h3><div class="api-list"><div id="apiStatusLine">GET /api/status</div><div id="apiPulseLine">GET /api/pc/pulse</div><div id="apiForceLine">GET /api/pc/forceshutdown</div><div id="apiTestOnLine">GET /api/pc/test/on</div><div id="apiTestOffLine">GET /api/pc/test/off</div><div id="apiTimingsLine">GET /api/config/timings?pulse_ms=500&amp;force_ms=3000</div><div id="apiWifiScanLine">GET /api/wifi/scan</div><div id="apiWifiLine">POST /api/config/wifi (body: ssid=SSID&amp;password=PASSWORD)</div><div id="apiLogsLine">GET /api/logs?limit=30</div><div id="apiLogsClearLine">GET /api/logs/clear</div><div id="apiBuglogLine">GET /api/buglog</div><div id="apiBuglogClearLine">GET /api/buglog/clear</div><div id="apiBootHistoryLine">GET /api/boot-history?limit=12</div><div id="apiRebootLine">GET /api/reboot</div><div id="apiBootRecoveryLine">GET /api/boot-recovery</div></div></div>
   </div>
   <div class="modal-backdrop" id="modal"><div class="modal"><h3 id="modalTitle">Conferma</h3><p id="modalText"></p><div class="modal-actions"><button class="b-cancel" onclick="closeModal()">Annulla</button><button class="b-save" onclick="confirmModalAction()">OK</button></div></div></div>
   <script>
@@ -2996,7 +3011,7 @@ R"HTML(
     function closeModal(clearWifiFields = false){ pendingAction = null; if(clearWifiFields){ pendingWifiConfig = null; document.getElementById('wifiSsidInput').value = ''; document.getElementById('wifiPassInput').value = ''; } document.getElementById('modal').classList.remove('show'); }
     function confirmModalAction(){ const action = pendingAction; if(!action) return; action(); }
     function pickScannedWifi(){ const selected = document.getElementById('wifiSelect').value; if(selected){ document.getElementById('wifiSsidInput').value = selected; wifiFormDirty = true; } }
-    function refreshApiLegend(){ document.getElementById('apiStatusLine').textContent = `GET ${baseUrl()}/api/status`; document.getElementById('apiPulseLine').textContent = `GET ${baseUrl()}/api/pc/pulse`; document.getElementById('apiForceLine').textContent = `GET ${baseUrl()}/api/pc/forceshutdown`; document.getElementById('apiTestOnLine').textContent = `GET ${baseUrl()}/api/pc/test/on`; document.getElementById('apiTestOffLine').textContent = `GET ${baseUrl()}/api/pc/test/off`; document.getElementById('apiTimingsLine').textContent = `GET ${baseUrl()}/api/config/timings?pulse_ms=500&force_ms=3000`; document.getElementById('apiWifiScanLine').textContent = `GET ${baseUrl()}/api/wifi/scan`; document.getElementById('apiWifiLine').textContent = `POST ${baseUrl()}/api/config/wifi  body: ssid=SSID&password=PASSWORD`; document.getElementById('apiLogsLine').textContent = `GET ${baseUrl()}/api/logs?limit=30`; document.getElementById('apiLogsClearLine').textContent = `GET ${baseUrl()}/api/logs/clear`; document.getElementById('apiBuglogLine').textContent = `GET ${baseUrl()}/api/buglog`; document.getElementById('apiBuglogClearLine').textContent = `GET ${baseUrl()}/api/buglog/clear`; document.getElementById('apiBootHistoryLine').textContent = `GET ${baseUrl()}/api/boot-history?limit=12`; document.getElementById('apiRebootLine').textContent = `GET ${baseUrl()}/api/reboot`; document.getElementById('apiBootRecoveryLine').textContent = `GET ${baseUrl()}/api/boot-recovery`; document.getElementById('apiTelegramHealthLine').textContent = `GET ${baseUrl()}/api/telegram/health`; document.getElementById('apiTelegramRecoverLine').textContent = `GET ${baseUrl()}/api/telegram/recover?reset_offset=1`; }
+function refreshApiLegend(){ document.getElementById('apiStatusLine').textContent = `GET ${baseUrl()}/api/status`; document.getElementById('apiPulseLine').textContent = `GET ${baseUrl()}/api/pc/pulse`; document.getElementById('apiForceLine').textContent = `GET ${baseUrl()}/api/pc/forceshutdown`; document.getElementById('apiTestOnLine').textContent = `GET ${baseUrl()}/api/pc/test/on`; document.getElementById('apiTestOffLine').textContent = `GET ${baseUrl()}/api/pc/test/off`; document.getElementById('apiTimingsLine').textContent = `GET ${baseUrl()}/api/config/timings?pulse_ms=500&force_ms=3000`; document.getElementById('apiWifiScanLine').textContent = `GET ${baseUrl()}/api/wifi/scan`; document.getElementById('apiWifiLine').textContent = `POST ${baseUrl()}/api/config/wifi  body: ssid=SSID&password=PASSWORD`; document.getElementById('apiLogsLine').textContent = `GET ${baseUrl()}/api/logs?limit=30`; document.getElementById('apiLogsClearLine').textContent = `GET ${baseUrl()}/api/logs/clear`; document.getElementById('apiBuglogLine').textContent = `GET ${baseUrl()}/api/buglog`; document.getElementById('apiBuglogClearLine').textContent = `GET ${baseUrl()}/api/buglog/clear`; document.getElementById('apiBootHistoryLine').textContent = `GET ${baseUrl()}/api/boot-history?limit=12`; document.getElementById('apiRebootLine').textContent = `GET ${baseUrl()}/api/reboot`; document.getElementById('apiBootRecoveryLine').textContent = `GET ${baseUrl()}/api/boot-recovery`; }
 async function scanWifiNetworks(){ const info = document.getElementById('wifiScanInfo'); const select = document.getElementById('wifiSelect'); info.textContent = 'Scan...'; select.innerHTML = '<option value="">Rete trovata</option>'; try{ for(let attempt = 0; attempt < 30; attempt++){ const r = await fetch('/api/wifi/scan', {cache:'no-store'}); const j = await r.json(); if(j.scanning){ info.textContent = 'Scan in corso...'; await new Promise((resolve) => setTimeout(resolve, 500)); continue; } (j.networks || []).forEach((n) => { const opt = document.createElement('option'); opt.value = n.ssid; opt.textContent = `${n.ssid} (${n.signal_pct}%, ${n.rssi} dBm${n.open ? ', open' : ''})`; select.appendChild(opt); }); info.textContent = `${j.count || 0} reti trovate`; return; } info.textContent = 'Scan timeout'; } catch(e) { info.textContent = 'Scan KO'; } }
     function updateStatusView(j){ document.getElementById('ipLine').textContent = `IP: ${j.ip}`; document.getElementById('mode').textContent = j.mode; document.getElementById('output').textContent = j.output_high ? 'HIGH' : 'LOW'; document.getElementById('rssi').textContent = `${j.rssi} dBm`; document.getElementById('signal').textContent = `${j.signal_pct}%`; document.getElementById('romeTime').textContent = j.rome_time; document.getElementById('uptime').textContent = j.uptime_human; document.getElementById('fwVersion').textContent = j.fw_version; document.getElementById('fwBuild').textContent = j.fw_build; document.getElementById('fwSlot').textContent = j.running_partition; document.getElementById('chipModel').textContent = j.chip_model; document.getElementById('resetReason').textContent = j.reset_reason; document.getElementById('last').textContent = j.last_trigger; const modeBits = []; modeBits.push(j.wifi_connected ? 'WiFi connected' : 'WiFi offline'); if(j.ap_mode) modeBits.push('AP mode active'); if(j.telegram_confirm_pending) modeBits.push('Telegram confirm pending'); if(j.test_timeout_remaining_s > 0) modeBits.push(`TEST timeout ${j.test_timeout_remaining_s}s`); modeBits.push(`Logs ${j.log_count}`); document.getElementById('extraState').textContent = modeBits.join(' | ') || '-'; if(!timingFormDirty){ document.getElementById('pulseMsInput').value = j.pulse_ms; document.getElementById('forceMsInput').value = j.force_ms; } if(!wifiFormDirty){ document.getElementById('wifiSsidInput').value = j.wifi_configured_ssid || ''; } document.getElementById('pulseBtn').textContent = `PULSE ${j.pulse_ms} ms`; document.getElementById('forceBtn').textContent = `FORCE SHUTDOWN ${j.force_ms} ms`; }
     async function refreshLogs(){ try{ const r = await fetch('/api/logs?limit=30', {cache:'no-store'}); const j = await r.json(); document.getElementById('logBox').textContent = (j.logs && j.logs.length) ? j.logs.join('\n') : 'Nessun log.'; } catch(e){ document.getElementById('logBox').textContent = 'Log non disponibili.'; } }
@@ -3535,8 +3550,10 @@ void setupRoutes() {
   server.on("/resetwifi", handleResetWiFi);
   server.on("/status", handleApiStatus);
   server.on("/api/status", handleApiStatus);
-  server.on("/api/telegram/health", HTTP_GET, handleApiTelegramHealth);
-  server.on("/api/telegram/recover", HTTP_GET, handleApiTelegramRecover);
+  if (TELEGRAM_RUNTIME_ENABLED) {
+    server.on("/api/telegram/health", HTTP_GET, handleApiTelegramHealth);
+    server.on("/api/telegram/recover", HTTP_GET, handleApiTelegramRecover);
+  }
   server.on("/api/logs", HTTP_GET, handleApiLogs);
   server.on("/api/logs/clear", HTTP_GET, handleApiLogsClear);
   server.on("/api/buglog", HTTP_GET, handleApiBugLogDump);
