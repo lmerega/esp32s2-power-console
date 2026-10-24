@@ -20,7 +20,7 @@ WebServer server(80);
 WiFiManager wm;
 Preferences prefs;
 
-#define FW_VERSION "1.6.0"
+#define FW_VERSION "1.6.2"
 
 // =====================
 // PIN (S2 mini)
@@ -253,7 +253,7 @@ const unsigned long SAFE_MODE_CLEAR_MS = 60000;  // dopo 60s stabili ??? reset c
 const uint8_t SOFTLOCK_FACTORY_BOOT_THRESHOLD = 3;
 const unsigned long SOFTLOCK_CLEAR_MS = 120000;
 const uint8_t PERSISTENT_FACTORY_BOOT_THRESHOLD = 3;
-const unsigned long PERSISTENT_BOOT_CLEAR_MS = 600000;
+const unsigned long PERSISTENT_BOOT_CLEAR_MS = 60000;
 const uint8_t BOOT_HISTORY_CAPACITY = 12;
 bool safeModeActive = false;
 unsigned long safeModeClearAtMs = 0;

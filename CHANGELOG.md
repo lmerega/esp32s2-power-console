@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-24 - Firmware 1.6.2
+
+- Ridotto da 10 minuti a 60 secondi il tempo di uptime sano richiesto per azzerare il contatore persistente degli avvii.
+- Il reset del contatore richiede ancora server HTTP avviato e WiFi connesso oppure AP di fallback attivo.
+- Mantenuti il limite di 3 avvii falliti e le protezioni separate per crash e blocchi watchdog.
+
 ## 2026-04-08
 
 - Bump firmware principale a `1.6.0`

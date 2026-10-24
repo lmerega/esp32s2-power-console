@@ -7,14 +7,14 @@ Firmware per `LOLIN S2 Mini` usato come controllo remoto del tasto power del PC 
 
 Versione firmware principale corrente:
 
-- `1.6.0`
+- `1.6.2`
 
 Ultima build verificata localmente:
 
-- data: `2026-04-08`
-- main bin: `1,146,000 B`
-- sketch usage: `1,145,851 B / 1,507,328 B` (`76%`)
-- RAM globale: `68,868 B / 327,680 B` (`21%`)
+- data: `2026-10-24`
+- main bin: `1,147,600 B`
+- sketch usage: `1,147,439 B / 1,507,328 B` (`76%`)
+- RAM globale: `75,772 B / 327,680 B` (`23%`)
 - build locale completata con successo: `si`
 
 ## Funzioni principali
@@ -36,7 +36,7 @@ Ultima build verificata localmente:
 - Scan WiFi asincrono dalla dashboard
 - Nessun passaggio automatico in recovery factory per sola perdita WiFi
 - Fallback automatico in `factory` dopo `3` boot falliti persistiti in `NVS`
-- Azzeramento del contatore boot solo dopo `10` minuti di uptime sano
+- Azzeramento del contatore boot dopo `60` secondi di uptime sano, con server HTTP avviato e WiFi oppure AP pronti
 - Favicon SVG inline con icona power su dashboard e pagina OTA
 
 ## Board e build
@@ -68,7 +68,7 @@ Note build:
 - Il wrapper `.bat` accetta anche l'alias rapido `bump`
 - Lo script continua a pulire i `.bin` precedenti e a copiare gli output nella cartella dello sketch
 - Gli script di test PowerShell non fanno piu parte del workspace operativo
-- La build validata piu recente del main firmware pesa `1,146,000 B`
+- La build validata piu recente del main firmware pesa `1,147,600 B`
 
 ## Repository e GitHub
 
