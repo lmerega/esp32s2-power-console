@@ -7,15 +7,18 @@ Firmware per `LOLIN S2 Mini` usato come controllo remoto del tasto power del PC 
 
 Versione firmware principale corrente:
 
-- `1.6.2`
+- `1.6.3`
 
 Ultima build verificata localmente:
 
-- data: `2026-10-24`
-- main bin: `1,147,600 B`
-- sketch usage: `1,147,439 B / 1,507,328 B` (`76%`)
-- RAM globale: `75,772 B / 327,680 B` (`23%`)
+- data: `2026-11-09`
+- main bin: `1,157,248 B`
+- sketch usage: `1,157,091 B / 1,507,328 B` (`76%`)
+- RAM globale: `75,916 B / 327,680 B` (`23%`)
 - build locale completata con successo: `si`
+- core ESP32: `3.3.8`
+- test dashboard scan: `6/6` passati con Node.js
+- verifica dispositivo: OTA 1.6.3, avvio e scan con checkpoint persistenti verificati
 
 ## Funzioni principali
 
@@ -34,10 +37,13 @@ Ultima build verificata localmente:
 - Buglog persistente in `NVS` con `magic`, `CRC8` e ring buffer
 - Heartbeat diagnostico persistente per `heap`, WiFi e stato task
 - Scan WiFi asincrono dalla dashboard
+- Diagnostica persistente di disconnessioni WiFi, perdita IP, reconnect e scan; contatori in `/api/status.wifi_diag`
 - Nessun passaggio automatico in recovery factory per sola perdita WiFi
 - Fallback automatico in `factory` dopo `3` boot falliti persistiti in `NVS`
 - Azzeramento del contatore boot dopo `60` secondi di uptime sano, con server HTTP avviato e WiFi oppure AP pronti
 - Favicon SVG inline con icona power su dashboard e pagina OTA
+
+La [guida diagnostica WiFi](WIFI_DIAGNOSTICS.md) descrive i codici `1700`-`1713`, i checkpoint dello scan e la raccolta dei log dopo un problema. La versione 1.6.3 e stata verificata sul dispositivo con upload OTA, avvio regolare e scan completo con checkpoint persistenti.
 
 ## Board e build
 

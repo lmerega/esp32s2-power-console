@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-09 - Firmware 1.6.3
+
+- Diagnostica WiFi persistente: motivo numerico e nome della disconnessione, RSSI/canale, perdita IP e durata dell'interruzione al riottenimento dell'IP.
+- Contatori diagnostici in `/api/status.wifi_diag`: disconnessioni, chiamate reconnect, errori immediati, eventi persi e ultimo esito scan.
+- Callback WiFi limitata a una coda non bloccante; scritture flash elaborate dal loop, con riepiloghi dei retry ogni 5 minuti.
+- Scan: marker persistito prima della chiamata al driver; esito, durata e heap a fine scansione. Supervisione di completamento/timeout dal loop anche senza polling del browser.
+- Checkpoint persistenti anche prima della generazione dei risultati JSON, quando pronti e dopo il ritorno dell'invio HTTP.
+- Corretta la dashboard scan: polling ogni 4 secondi compatibile con il rate limit, gestione HTTP 429/errori, timeout HTTP e protezione dai doppi clic. Aggiunti sei test Node.js sulla funzione effettiva della pagina.
+- Nessuna modifica a credenziali WiFi, politica di riconnessione, GPIO o layout partizioni.
+
 ## 2026-10-24 - Firmware 1.6.2
 
 - Ridotto da 10 minuti a 60 secondi il tempo di uptime sano richiesto per azzerare il contatore persistente degli avvii.

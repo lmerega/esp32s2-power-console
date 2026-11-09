@@ -15,12 +15,13 @@
 #include <sys/time.h>
 #include <freertos/semphr.h>
 #include "buglog.h"
+#include "wifi_diagnostics.h"
 
 WebServer server(80);
 WiFiManager wm;
 Preferences prefs;
 
-#define FW_VERSION "1.6.2"
+#define FW_VERSION "1.6.3"
 
 // =====================
 // PIN (S2 mini)
@@ -323,6 +324,10 @@ const unsigned long LED_BLINK_MS = 350;
 unsigned long ledNextToggleMs = 0;
 bool ledBlinkState = false;
 bool wifiScanPending = false;
+bool wifiScanFinished = false;
+bool wifiScanReplyPending = false;
+int wifiScanResult = WIFI_SCAN_RUNNING;
+const char *wifiScanError = nullptr;
 unsigned long wifiScanStartedMs = 0;
 unsigned long buglogHeartbeatNextMs = 0;
 const unsigned long HEAP_PROBE_LOG_COOLDOWN_MS = 10UL * 60UL * 1000UL;
@@ -2794,7 +2799,7 @@ void sendText(int code, const String &body) {
 
 String statusJson() {
   String json;
-  json.reserve(2800);  // BUG-4 FIX: ~2.5 KB con tutti i campi; 1600 causava 1-2 riallocazioni heap
+  json.reserve(3800);  // Include WiFi diagnostics without repeated heap reallocations.
   int rssi = WiFi.RSSI();
   unsigned long testRemainingMs = 0;
   unsigned long telegramPauseRemainingMs = 0;
@@ -2831,6 +2836,7 @@ String statusJson() {
   json += "\"wifi_ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
   json += "\"wifi_configured_ssid\":\"" + jsonEscape(wifiSsidConfig) + "\",";
   json += "\"wifi_connected\":" + String(wifiConnected() ? "true" : "false") + ",";
+  wifiDiagnosticsAppendJson(json);
   json += "\"ap_mode\":" + String(((WiFi.getMode() & WIFI_AP) != 0) ? "true" : "false") + ",";
   json += "\"fallback_ap_active\":" + String(fallbackApActive ? "true" : "false") + ",";
   json += "\"safe_mode\":" + String(safeModeActive ? "true" : "false") + ",";
@@ -2885,38 +2891,56 @@ String statusJson() {
   return json;
 }
 
+// Supervise scans from loop(), even when the browser stops polling.
+void serviceWifiScan() {
+  if (!wifiScanPending || wifiScanFinished) return;
+  int found = WiFi.scanComplete();
+  if (found == WIFI_SCAN_RUNNING) {
+    if (static_cast<unsigned long>(millis() - wifiScanStartedMs) < WIFI_SCAN_TIMEOUT_MS) return;
+    wifiScanResult = WIFI_SCAN_FAILED;
+    wifiScanError = "scan_timeout";
+    wifiDiagnosticsScanEnd("timeout", wifiScanResult);
+    WiFi.scanDelete();
+  } else {
+    wifiScanResult = found;
+    wifiScanError = found < 0 ? "scan_failed" : nullptr;
+    wifiDiagnosticsScanEnd(found < 0 ? "failed" : "done", found);
+    if (found < 0) WiFi.scanDelete();
+  }
+  wifiScanFinished = true;
+}
+
 String wifiScanJson() {
   ScopedHeapProbe heapProbe("wf_scan", 1605, heapProbeWifiScan);
   if (!wifiScanPending) {
+    wifiScanStartedMs = millis();
+    wifiScanFinished = false;
+    wifiScanResult = WIFI_SCAN_RUNNING;
+    wifiScanError = nullptr;
+    wifiDiagnosticsScanStart();  // Persist BEFORE any scan driver call can stall.
     WiFi.scanDelete();
     int scanStart = WiFi.scanNetworks(true, true);
     if (scanStart == WIFI_SCAN_FAILED) {
+      wifiDiagnosticsScanEnd("start_failed", scanStart);
       return "{\"ok\":false,\"error\":\"scan_start_failed\",\"count\":0,\"networks\":[]}";
     }
     wifiScanPending = true;
-    wifiScanStartedMs = millis();
     return "{\"ok\":true,\"scanning\":true,\"count\":0,\"networks\":[]}";
   }
 
-  int found = WiFi.scanComplete();
-  if (found == WIFI_SCAN_RUNNING) {
-    if ((long)(millis() - wifiScanStartedMs) >= (long)WIFI_SCAN_TIMEOUT_MS) {
-      WiFi.scanDelete();
-      wifiScanPending = false;
-      wifiScanStartedMs = 0;
-      return "{\"ok\":false,\"error\":\"scan_timeout\",\"count\":0,\"networks\":[]}";
-    }
+  serviceWifiScan();
+  if (!wifiScanFinished) {
     return "{\"ok\":true,\"scanning\":true,\"count\":0,\"networks\":[]}";
   }
-
-  if (found < 0) {
-    WiFi.scanDelete();
+  if (wifiScanError != nullptr) {
+    String error = "{\"ok\":false,\"error\":\"" + String(wifiScanError) + "\",\"count\":0,\"networks\":[]}";
     wifiScanPending = false;
-    wifiScanStartedMs = 0;
-    return "{\"ok\":false,\"error\":\"scan_failed\",\"count\":0,\"networks\":[]}";
+    wifiScanFinished = false;
+    return error;
   }
 
-  int safeCount = found;
+  int safeCount = wifiScanResult;
+  wifiDiagnosticsScanResponse("build", safeCount);
   String json;
   json.reserve(64 + (safeCount * 96));
   json = "{\"ok\":true,\"scanning\":false,\"count\":" + String(safeCount) + ",\"networks\":[";
@@ -2934,7 +2958,10 @@ String wifiScanJson() {
   json += "]}";
   WiFi.scanDelete();
   wifiScanPending = false;
+  wifiScanFinished = false;
   wifiScanStartedMs = 0;
+  wifiDiagnosticsScanResponse("ready", json.length());
+  wifiScanReplyPending = true;
   return json;
 }
 
@@ -2991,9 +3018,9 @@ R"HTML(
       </div>
       <div class="stack">
         <div class="panel"><h3>Comandi</h3><div class="config-row"><input id="pulseMsInput" type="number" min="50" step="10" placeholder="Pulse ms"><input id="forceMsInput" type="number" min="500" step="10" placeholder="Force ms"><button class="b-save" onclick="applyTimingsToDevice()">Salva</button></div><div class="buttons"><button id="pulseBtn" class="b-pulse" onclick="cmdPulse()">PULSE</button><button id="forceBtn" class="b-reset" onclick="cmdForceShutdown()">FORCE</button><button class="b-on" onclick="cmdTestOn()">TEST ON</button><button class="b-off" onclick="cmdTestOff()">TEST OFF</button><button class="b-reboot" onclick="cmdReboot()">REBOOT ESP</button><button class="b-ota" onclick="cmdOpenOta()">WEB OTA</button><button class="b-reset" onclick="cmdResetWifi()">RESET WIFI</button></div><div class="result" id="cmdResult">Pronto</div></div>
-        <div class="panel"><h3>WiFi</h3><div class="wifi-row"><select id="wifiSelect" onchange="pickScannedWifi()"><option value="">Rete trovata</option></select><button class="b-save" onclick="scanWifiNetworks()">Scansiona</button></div><div class="wifi-row"><input id="wifiSsidInput" type="text" placeholder="SSID"><input id="wifiPassInput" type="password" placeholder="Password"><button class="b-save" onclick="applyWifiToDevice()">Salva</button></div><div class="api-note" id="wifiScanInfo">Le credenziali WiFi vengono inviate con POST e il reboot resta manuale.</div></div>
+        <div class="panel"><h3>WiFi</h3><div class="wifi-row"><select id="wifiSelect" onchange="pickScannedWifi()"><option value="">Rete trovata</option></select><button id="wifiScanBtn" class="b-save" onclick="scanWifiNetworks()">Scansiona</button></div><div class="wifi-row"><input id="wifiSsidInput" type="text" placeholder="SSID"><input id="wifiPassInput" type="password" placeholder="Password"><button class="b-save" onclick="applyWifiToDevice()">Salva</button></div><div class="api-note" id="wifiScanInfo">Le credenziali WiFi vengono inviate con POST e il reboot resta manuale.</div></div>
         <div class="panel"><h3>Log RAM</h3><div class="config-row"><button class="b-save" onclick="refreshLogs()">Aggiorna</button><button class="b-save" onclick="copyLogsToClipboard()">Copy</button><button class="b-reset" onclick="clearLogs()">Pulisci</button></div><div class="api-note">Questi log sono volatili e si perdono al reboot o al power cycle.</div><div class="result" id="logBox" style="white-space:pre-wrap;max-height:220px;overflow:auto">Nessun log.</div></div>
-<div class="panel"><h3>Buglog Persistente</h3><div class="config-row"><button class="b-save" onclick="refreshBuglog()">Aggiorna</button><button class="b-save" onclick="copyBuglogToClipboard()">Copy</button><button class="b-reset" onclick="clearBuglog()">Pulisci</button></div><div class="api-note">Salvato in flash locale. Resta disponibile anche dopo reset e power cycle.</div><div class="buglog-layout"><div class="result" id="buglogBox" style="white-space:pre-wrap;max-height:220px;overflow:auto">Nessun buglog.</div><div class="legend"><div><b>Severity</b>: <code>INFO</code> = normale, <code>WARN</code> = anomalia, <code>ERROR</code> = errore, <code>FATAL</code> = reboot watchdog.</div><div style="margin-top:8px"><b>Code</b>: <code>1000</code> boot, <code>1001</code> crash reset, <code>1101</code> watchdog reboot, <code>1102</code> recovery/factory, <code>1201</code> reset WiFi, <code>1301</code>/<code>1302</code> task create fail, <code>1310</code> task recovery, <code>1311</code> task recovery con reset offset, <code>1312</code> failsafe Telegram, <code>1313</code> heap_guard richiesto, <code>1500</code> heartbeat ok, <code>1501</code> heartbeat anomalo, <code>1600</code> tg_poll, <code>1601</code> tg_send, <code>1602</code> tg_recovery, <code>1604</code> web_logs, <code>1605</code> wifi_scan, <code>1606</code> tg_status_msg, <code>1610</code>/<code>1611</code>/<code>1612</code>/<code>1613</code>/<code>1614</code> boot_probe, <code>1620</code> boot_cfg snapshot, <code>1621</code> boot_wifi snapshot, <code>1622</code> boot_ntp snapshot, <code>1623</code> boot_http snapshot, <code>1624</code> boot_tasks snapshot, <code>1625</code> tg_recovery snapshot, <code>1626</code> tg_send snapshot, <code>1627</code> tg_poll snapshot.</div><div style="margin-top:8px"><b>Heartbeat</b>: ogni 15 minuti se tutto e normale, ogni 2 minuti se rileva una condizione sospetta.</div><div style="margin-top:8px"><b>Campi heartbeat</b>: <code>fh</code> = free heap disponibile, <code>mb</code> = blocco heap contiguo massimo allocabile, <code>wf</code> = WiFi connesso (<code>1</code>) o non connesso (<code>0</code>), <code>la</code> = eta ultimo heartbeat del loop principale in ms, <code>ta</code> = eta ultimo heartbeat del task Telegram in ms.</div><div style="margin-top:8px"><b>Campi probe heap</b>: formato <code>tag beforeFree/beforeMax&gt;afterFree/afterMax</code>. Esempio <code>tg_poll 68024/57332&gt;15980/7668</code> = il polling Telegram e uscito con heap molto piu basso di come era entrato.</div><div style="margin-top:8px"><b>Campi snapshot</b>: formato <code>tag n=... fh=... mb=...</code>. Servono a mostrare lo stato heap subito dopo recovery/send/poll e a fine fase boot.</div><div style="margin-top:8px"><b>Nota</b>: il refresh di <code>/api/status</code> non genera piu warning nel buglog persistente.</div><div style="margin-top:8px"><b>Heap guard</b>: se <code>fh</code> scende sotto 22 KB o <code>mb</code> sotto 16 KB, il task Telegram si mette in pausa breve e il <code>loop()</code> prova un recovery controllato.</div></div></div></div>
+<div class="panel"><h3>Buglog Persistente</h3><div class="config-row"><button class="b-save" onclick="refreshBuglog()">Aggiorna</button><button class="b-save" onclick="copyBuglogToClipboard()">Copy</button><button class="b-reset" onclick="clearBuglog()">Pulisci</button></div><div class="api-note">Salvato in flash locale. Resta disponibile anche dopo reset e power cycle.</div><div class="buglog-layout"><div class="result" id="buglogBox" style="white-space:pre-wrap;max-height:220px;overflow:auto">Nessun buglog.</div><div class="legend"><div><b>Severity</b>: <code>INFO</code> = normale, <code>WARN</code> = anomalia, <code>ERROR</code> = errore, <code>FATAL</code> = reboot watchdog.</div><div style="margin-top:8px"><b>Code</b>: <code>1000</code> boot, <code>1001</code> crash reset, <code>1101</code> watchdog reboot, <code>1102</code> recovery/factory, <code>1201</code> reset WiFi, <code>1700</code> WiFi disconnesso (motivo), <code>1701</code> IP acquisito/riconnessione, <code>1702</code> IP perso, <code>1703</code> tentativi reconnect, <code>1704</code> avvio/stop STA, <code>1705</code> diagnostica/coda eventi, <code>1710</code> scan avviato, <code>1711</code> scan terminato/errore/timeout, <code>1712</code> preparazione/invio risposta scan, <code>1713</code> scan rate limit, <code>1301</code>/<code>1302</code> task create fail, <code>1310</code> task recovery, <code>1311</code> task recovery con reset offset, <code>1312</code> failsafe Telegram, <code>1313</code> heap_guard richiesto, <code>1500</code> heartbeat ok, <code>1501</code> heartbeat anomalo, <code>1600</code> tg_poll, <code>1601</code> tg_send, <code>1602</code> tg_recovery, <code>1604</code> web_logs, <code>1605</code> wifi_scan, <code>1606</code> tg_status_msg, <code>1610</code>/<code>1611</code>/<code>1612</code>/<code>1613</code>/<code>1614</code> boot_probe, <code>1620</code> boot_cfg snapshot, <code>1621</code> boot_wifi snapshot, <code>1622</code> boot_ntp snapshot, <code>1623</code> boot_http snapshot, <code>1624</code> boot_tasks snapshot, <code>1625</code> tg_recovery snapshot, <code>1626</code> tg_send snapshot, <code>1627</code> tg_poll snapshot.</div><div style="margin-top:8px"><b>Heartbeat</b>: ogni 15 minuti se tutto e normale, ogni 2 minuti se rileva una condizione sospetta.</div><div style="margin-top:8px"><b>Campi heartbeat</b>: <code>fh</code> = free heap disponibile, <code>mb</code> = blocco heap contiguo massimo allocabile, <code>wf</code> = WiFi connesso (<code>1</code>) o non connesso (<code>0</code>), <code>la</code> = eta ultimo heartbeat del loop principale in ms, <code>ta</code> = eta ultimo heartbeat del task Telegram in ms.</div><div style="margin-top:8px"><b>Campi probe heap</b>: formato <code>tag beforeFree/beforeMax&gt;afterFree/afterMax</code>. Esempio <code>tg_poll 68024/57332&gt;15980/7668</code> = il polling Telegram e uscito con heap molto piu basso di come era entrato.</div><div style="margin-top:8px"><b>Campi snapshot</b>: formato <code>tag n=... fh=... mb=...</code>. Servono a mostrare lo stato heap subito dopo recovery/send/poll e a fine fase boot.</div><div style="margin-top:8px"><b>Nota</b>: il refresh di <code>/api/status</code> non genera piu warning nel buglog persistente.</div><div style="margin-top:8px"><b>Heap guard</b>: se <code>fh</code> scende sotto 22 KB o <code>mb</code> sotto 16 KB, il task Telegram si mette in pausa breve e il <code>loop()</code> prova un recovery controllato.</div></div></div></div>
       </div>
     </div>
 <div class="api-box"><h3>API</h3><div class="api-list"><div id="apiStatusLine">GET /api/status</div><div id="apiPulseLine">GET /api/pc/pulse</div><div id="apiForceLine">GET /api/pc/forceshutdown</div><div id="apiTestOnLine">GET /api/pc/test/on</div><div id="apiTestOffLine">GET /api/pc/test/off</div><div id="apiTimingsLine">GET /api/config/timings?pulse_ms=500&amp;force_ms=3000</div><div id="apiWifiScanLine">GET /api/wifi/scan</div><div id="apiWifiLine">POST /api/config/wifi (body: ssid=SSID&amp;password=PASSWORD)</div><div id="apiLogsLine">GET /api/logs?limit=30</div><div id="apiLogsClearLine">GET /api/logs/clear</div><div id="apiBuglogLine">GET /api/buglog</div><div id="apiBuglogClearLine">GET /api/buglog/clear</div><div id="apiBootHistoryLine">GET /api/boot-history?limit=12</div><div id="apiRebootLine">GET /api/reboot</div><div id="apiBootRecoveryLine">GET /api/boot-recovery</div></div></div>
@@ -3011,7 +3038,53 @@ R"HTML(
     function confirmModalAction(){ const action = pendingAction; if(!action) return; action(); }
     function pickScannedWifi(){ const selected = document.getElementById('wifiSelect').value; if(selected){ document.getElementById('wifiSsidInput').value = selected; wifiFormDirty = true; } }
 function refreshApiLegend(){ document.getElementById('apiStatusLine').textContent = `GET ${baseUrl()}/api/status`; document.getElementById('apiPulseLine').textContent = `GET ${baseUrl()}/api/pc/pulse`; document.getElementById('apiForceLine').textContent = `GET ${baseUrl()}/api/pc/forceshutdown`; document.getElementById('apiTestOnLine').textContent = `GET ${baseUrl()}/api/pc/test/on`; document.getElementById('apiTestOffLine').textContent = `GET ${baseUrl()}/api/pc/test/off`; document.getElementById('apiTimingsLine').textContent = `GET ${baseUrl()}/api/config/timings?pulse_ms=500&force_ms=3000`; document.getElementById('apiWifiScanLine').textContent = `GET ${baseUrl()}/api/wifi/scan`; document.getElementById('apiWifiLine').textContent = `POST ${baseUrl()}/api/config/wifi  body: ssid=SSID&password=PASSWORD`; document.getElementById('apiLogsLine').textContent = `GET ${baseUrl()}/api/logs?limit=30`; document.getElementById('apiLogsClearLine').textContent = `GET ${baseUrl()}/api/logs/clear`; document.getElementById('apiBuglogLine').textContent = `GET ${baseUrl()}/api/buglog`; document.getElementById('apiBuglogClearLine').textContent = `GET ${baseUrl()}/api/buglog/clear`; document.getElementById('apiBootHistoryLine').textContent = `GET ${baseUrl()}/api/boot-history?limit=12`; document.getElementById('apiRebootLine').textContent = `GET ${baseUrl()}/api/reboot`; document.getElementById('apiBootRecoveryLine').textContent = `GET ${baseUrl()}/api/boot-recovery`; }
-async function scanWifiNetworks(){ const info = document.getElementById('wifiScanInfo'); const select = document.getElementById('wifiSelect'); info.textContent = 'Scan...'; select.innerHTML = '<option value="">Rete trovata</option>'; try{ for(let attempt = 0; attempt < 30; attempt++){ const r = await fetch('/api/wifi/scan', {cache:'no-store'}); const j = await r.json(); if(j.scanning){ info.textContent = 'Scan in corso...'; await new Promise((resolve) => setTimeout(resolve, 500)); continue; } (j.networks || []).forEach((n) => { const opt = document.createElement('option'); opt.value = n.ssid; opt.textContent = `${n.ssid} (${n.signal_pct}%, ${n.rssi} dBm${n.open ? ', open' : ''})`; select.appendChild(opt); }); info.textContent = `${j.count || 0} reti trovate`; return; } info.textContent = 'Scan timeout'; } catch(e) { info.textContent = 'Scan KO'; } }
+let wifiScanBusy = false;
+async function scanWifiNetworks(){
+  if(wifiScanBusy) return;
+  wifiScanBusy = true;
+  const info = document.getElementById('wifiScanInfo');
+  const select = document.getElementById('wifiSelect');
+  const button = document.getElementById('wifiScanBtn');
+  button.disabled = true;
+  info.textContent = 'Scan...';
+  select.innerHTML = '<option value="">Rete trovata</option>';
+  try{
+    for(let attempt = 0; attempt < 8; attempt++){
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      let r, j;
+      try{
+        r = await fetch('/api/wifi/scan', {cache:'no-store', signal:controller.signal});
+        j = await r.json();
+      } finally { clearTimeout(timeout); }
+      if(r.status === 429){
+        info.textContent = 'Attendo disponibilita scan...';
+        await new Promise((resolve) => setTimeout(resolve, 4000));
+        continue;
+      }
+      if(!r.ok || j.ok === false) throw new Error(j.error || `HTTP ${r.status}`);
+      if(j.scanning){
+        info.textContent = 'Scan in corso...';
+        await new Promise((resolve) => setTimeout(resolve, 4000));
+        continue;
+      }
+      (j.networks || []).forEach((n) => {
+        const opt = document.createElement('option');
+        opt.value = n.ssid;
+        opt.textContent = `${n.ssid} (${n.signal_pct}%, ${n.rssi} dBm${n.open ? ', open' : ''})`;
+        select.appendChild(opt);
+      });
+      info.textContent = `${j.count || 0} reti trovate`;
+      return;
+    }
+    info.textContent = 'Scan timeout';
+  } catch(e) {
+    info.textContent = e.name === 'AbortError' ? 'Scan KO: dispositivo non risponde' : `Scan KO: ${e.message}`;
+  } finally {
+    wifiScanBusy = false;
+    button.disabled = false;
+  }
+}
     function updateStatusView(j){ document.getElementById('ipLine').textContent = `IP: ${j.ip}`; document.getElementById('mode').textContent = j.mode; document.getElementById('output').textContent = j.output_high ? 'HIGH' : 'LOW'; document.getElementById('rssi').textContent = `${j.rssi} dBm`; document.getElementById('signal').textContent = `${j.signal_pct}%`; document.getElementById('romeTime').textContent = j.rome_time; document.getElementById('uptime').textContent = j.uptime_human; document.getElementById('fwVersion').textContent = j.fw_version; document.getElementById('fwBuild').textContent = j.fw_build; document.getElementById('fwSlot').textContent = j.running_partition; document.getElementById('chipModel').textContent = j.chip_model; document.getElementById('resetReason').textContent = j.reset_reason; document.getElementById('last').textContent = j.last_trigger; const modeBits = []; modeBits.push(j.wifi_connected ? 'WiFi connected' : 'WiFi offline'); if(j.ap_mode) modeBits.push('AP mode active'); if(j.telegram_confirm_pending) modeBits.push('Telegram confirm pending'); if(j.test_timeout_remaining_s > 0) modeBits.push(`TEST timeout ${j.test_timeout_remaining_s}s`); modeBits.push(`Logs ${j.log_count}`); document.getElementById('extraState').textContent = modeBits.join(' | ') || '-'; if(!timingFormDirty){ document.getElementById('pulseMsInput').value = j.pulse_ms; document.getElementById('forceMsInput').value = j.force_ms; } if(!wifiFormDirty){ document.getElementById('wifiSsidInput').value = j.wifi_configured_ssid || ''; } document.getElementById('pulseBtn').textContent = `PULSE ${j.pulse_ms} ms`; document.getElementById('forceBtn').textContent = `FORCE SHUTDOWN ${j.force_ms} ms`; }
     async function refreshLogs(){ try{ const r = await fetch('/api/logs?limit=30', {cache:'no-store'}); const j = await r.json(); document.getElementById('logBox').textContent = (j.logs && j.logs.length) ? j.logs.join('\n') : 'Nessun log.'; } catch(e){ document.getElementById('logBox').textContent = 'Log non disponibili.'; } }
     async function clearLogs(){ const r = await fetch('/api/logs/clear', {method:'GET'}); const t = await r.text(); setResult(`/api/logs/clear ${r.status} ${t.substring(0,90)}`); setTimeout(refreshLogs,120); setTimeout(refreshStatus,120); }
@@ -3239,8 +3312,16 @@ void handleApiBootHistory() {
 }
 
 void handleApiWifiScan() {
-  if (!guardJsonRateLimit(webWifiScanBucket, WEB_WIFI_SCAN_WINDOW_MS, WEB_WIFI_SCAN_MAX_HITS, WEB_WIFI_SCAN_MIN_GAP_MS, "scan_rate_limited")) return;
-  sendJson(200, wifiScanJson());
+  if (!guardJsonRateLimit(webWifiScanBucket, WEB_WIFI_SCAN_WINDOW_MS, WEB_WIFI_SCAN_MAX_HITS, WEB_WIFI_SCAN_MIN_GAP_MS, "scan_rate_limited")) {
+    wifiDiagnosticsScanRejected();
+    return;
+  }
+  String response = wifiScanJson();
+  sendJson(200, response);
+  if (wifiScanReplyPending) {
+    wifiDiagnosticsScanResponse("sent", response.length());
+    wifiScanReplyPending = false;
+  }
 }
 void handleApiLogs() {
   int limit = server.hasArg("limit") ? server.arg("limit").toInt() : 30;
@@ -3586,6 +3667,7 @@ void setup() {
   Serial.begin(115200);
   bootMillisBaseline = millis();
   buglog_begin();
+  wifiDiagnosticsBegin();
   clearWebLogs();
   resetOtaUploadProgress();
   bootPresenceReportedOk = false;
@@ -3751,6 +3833,7 @@ void setup() {
     logLine("[WiFi] Non connesso (AP mode attivo).");
   }
 
+  wifiDiagnosticsPoll();
   lastWiFiConnected = wifiConnected();
   wifiOfflineSinceMs = lastWiFiConnected ? 0 : millis();
 
@@ -3796,6 +3879,8 @@ void setup() {
 void loop() {
   markLoopHeartbeat();
   buglog_tick();
+  wifiDiagnosticsPoll();
+  serviceWifiScan();
   maybeLogPersistentHeartbeat();
   maybeRecoverTelegramTask();
   processNodeRedPresenceReport();
@@ -3892,7 +3977,8 @@ void loop() {
   static unsigned long nextWiFiTry = 0;
   if (!wifiConnected() && (nextWiFiTry == 0 || (long)(millis() - nextWiFiTry) >= 0)) {
     nextWiFiTry = millis() + WIFI_RECONNECT_EVERY_MS;
-    WiFi.reconnect();
+    bool accepted = WiFi.reconnect();
+    wifiDiagnosticsReconnectAttempt(accepted);
   }
 
   if (wifiNowConnected && (wifiConfigNeedsSync || wifiSsidConfig.length() == 0)) {
